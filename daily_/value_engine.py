@@ -99,7 +99,7 @@ def ev_kelly(p: float, odds: float, k_fraction: float=1.0):
         p = float(p); o = float(odds)
         if not (0<=p<=1) or o<=1: return None, None
         ev = p*o - 1
-        num = p*o - 1.0
+        num = ev
         den = (o - 1.0)
         f = num/den if den>0 else None
         if f is None:
