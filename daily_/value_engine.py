@@ -99,10 +99,17 @@ def ev_kelly(p: float, odds: float, k_fraction: float=1.0):
         p = float(p); o = float(odds)
         if not (0<=p<=1) or o<=1: return None, None
         ev = p*o - 1
-        num = (p*o - (1-p)); den = (o - 1.0)
+        num = p*o - 1.0
+        den = (o - 1.0)
         f = num/den if den>0 else None
-        if f is None or f<=0: return round(ev,6), None
-        return round(ev,6), round(min(1.0, max(0.0, f*k_fraction)), 6)
+        if f is None:
+            return round(ev,6), None
+        if f <= 0:
+            return (round(ev,6), 0.0) if abs(f) <= 1e-9 else (round(ev,6), None)
+        f_adj = min(1.0, max(0.0, f*k_fraction))
+        if f_adj <= 0:
+            return round(ev,6), 0.0
+        return round(ev,6), round(f_adj, 6)
     except Exception:
         return None, None
 
