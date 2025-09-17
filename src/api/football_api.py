@@ -1,7 +1,7 @@
 # === src/api/football_api.py · 并发复用 + 退避重试 + 限速 + 轻量缓存 + 主盘/全线聚合（含角球/Asian Totals） ===
 from __future__ import annotations
 
-import os, json, time, hashlib, threading
+import os, json, time, hashlib, threading, re
 from typing import Any, Dict, List, Optional
 import requests
 from requests.adapters import HTTPAdapter
@@ -111,11 +111,83 @@ def find_league(country: str, league_name: str, season: int) -> Optional[int]:
         return data["response"][0]["league"]["id"]
     return None
 
+_SIDE_TOKENS = {
+    "home": "home",
+    "1": "home",
+    "team1": "home",
+    "h": "home",
+    "away": "away",
+    "2": "away",
+    "team2": "away",
+    "a": "away",
+    "guest": "away",
+    "visitor": "away",
+}
+
+_PICK_TOKENS = {"pk", "pick", "pick'em", "pickem", "p.k.", "p.k"}
+_NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
+
+
 def _median(arr):
     arr = [x for x in (arr or []) if x]
-    if not arr: return None
-    arr = sorted(arr); n = len(arr)
+    if not arr:
+        return None
+    arr = sorted(arr)
+    n = len(arr)
     return float(arr[n // 2]) if n % 2 == 1 else float((arr[n // 2 - 1] + arr[n // 2]) / 2)
+
+
+def _parse_float(value, default=None):
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    text = str(value).strip()
+    if not text:
+        return default
+    text_norm = text.lower().replace("−", "-")
+    if text_norm in _PICK_TOKENS:
+        return 0.0
+
+    try:
+        return float(text_norm.replace(",", "."))
+    except ValueError:
+        match = _NUM_RE.search(text_norm)
+        if match:
+            token = match.group(0).replace(",", ".")
+            try:
+                return float(token)
+            except ValueError:
+                return default
+    return default
+
+
+def _normalise_side(value) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    text = text.replace("home team", "home").replace("away team", "away")
+    if "home" in text:
+        return "home"
+    if "away" in text or "visitor" in text or "guest" in text:
+        return "away"
+
+    tokens = [tok for tok in re.split(r"[^a-z0-9]+", text) if tok]
+    for token in tokens:
+        if token in _SIDE_TOKENS:
+            return _SIDE_TOKENS[token]
+    return None
+
+
+def _extract_handicap(entry: Dict[str, Any]) -> float | None:
+    line = _parse_float(entry.get("handicap"))
+    if line is not None:
+        return line
+    return _parse_float(entry.get("value"))
 
 def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
     try:
@@ -232,10 +304,10 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                 # 亚洲让球（非角球）
                 if is_asian_handicap(name):
                     for v in values:
-                        side_txt = (v.get("value") or "").lower().strip()   # "Home"/"Away"
+                        side_txt = _normalise_side(v.get("value"))
                         odd = _parse_float(v.get("odd"))
-                        line = _parse_float(v.get("handicap"))
-                        if side_txt not in ("home","away") or line is None or odd is None:
+                        line = _extract_handicap(v)
+                        if side_txt not in ("home", "away") or line is None or odd is None:
                             continue
                         if not (1.10 <= odd <= 50.0):
                             continue

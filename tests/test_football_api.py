@@ -119,3 +119,47 @@ def test_first_half_asian_handicap_filtered(monkeypatch):
             "away": [2.0],
         }
     }
+
+
+def test_asian_handicap_with_embedded_line(monkeypatch):
+    fake_odds = {
+        "response": [
+            {
+                "bookmakers": [
+                    {
+                        "bets": [
+                            {
+                                "name": "Asian Handicap",
+                                "values": [
+                                    {"value": "Home -0.25", "odd": "1.95", "handicap": None},
+                                    {"value": "Away +0.25", "odd": "1.95", "handicap": None},
+                                ],
+                            },
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+
+    def _fake_get_cached(endpoint, params, ttl_sec):  # pragma: no cover - exercised in test
+        return fake_odds
+
+    monkeypatch.setattr(football_api, "_get_cached", _fake_get_cached)
+
+    result = football_api.odds_by_fixture(5678)
+
+    raw = result.get("_raw_ah_map")
+    assert raw is not None
+    assert set(raw.keys()) == {-0.25}
+    assert raw[-0.25]["home"][0] == pytest.approx(1.95)
+    assert raw[-0.25]["away"][0] == pytest.approx(1.95)
+
+    lines = result.get("ah_lines")
+    assert lines is not None
+    entry = lines.get("-0.25")
+    assert entry is not None
+    assert entry["home_median"] == pytest.approx(1.95)
+    assert entry["away_median"] == pytest.approx(1.95)
+    assert entry["home_cnt"] == 1
+    assert entry["away_cnt"] == 1
