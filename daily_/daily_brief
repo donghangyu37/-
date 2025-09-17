@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 # —— 项目内模块
-from src.api.football_api import fixtures_by_date, team_statistics, odds_by_fixture
+from src.api.football_api import fixtures_by_date, team_statistics, odds_by_fixture, recent_fixtures_by_team
 from src.data.transform import league_goal_averages
 from src.models.poisson_mc import expected_goals_from_strengths, monte_carlo_simulate, simulate_goals
 from src.markets.asian_handicap import ah_probabilities_from_lams, ah_ev_kelly
@@ -44,6 +44,46 @@ MIN_EV = 0.00
 # 角球 λ 兜底
 CORNER_BASE = 7.5
 CORNER_PER_GOAL = 0.9
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        raw = os.getenv(name)
+        if raw is None or raw == "":
+            return float(default)
+        return float(raw)
+    except Exception:
+        return float(default)
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        raw = os.getenv(name)
+        if raw is None or raw == "":
+            return int(default)
+        return int(float(raw))
+    except Exception:
+        return int(default)
+
+LAMBDA_MODEL_CONFIG = {
+    "season": {
+        "weight": _env_float("LAM_WEIGHT_SEASON", 0.6),
+    },
+    "recent": {
+        "weight": _env_float("LAM_WEIGHT_RECENT", 0.4 if USE_RECENT else 0.0),
+        "recent_games": _env_int("LAM_RECENT_GAMES", 6),
+        "min_games": _env_int("LAM_RECENT_MIN_GAMES", 3),
+        "decay": _env_float("LAM_RECENT_DECAY", 0.85),
+        "fetch_last": _env_int("LAM_RECENT_FETCH_LAST", 12),
+        "season_mix": _env_float("LAM_RECENT_SEASON_MIX", 0.3),
+    },
+}
+
+if LAMBDA_MODEL_CONFIG["recent"]["min_games"] > LAMBDA_MODEL_CONFIG["recent"]["recent_games"]:
+    LAMBDA_MODEL_CONFIG["recent"]["min_games"] = LAMBDA_MODEL_CONFIG["recent"]["recent_games"]
+
+if LAMBDA_MODEL_CONFIG["recent"]["fetch_last"] < LAMBDA_MODEL_CONFIG["recent"]["recent_games"]:
+    LAMBDA_MODEL_CONFIG["recent"]["fetch_last"] = LAMBDA_MODEL_CONFIG["recent"]["recent_games"]
+
+LOG_LAMBDA_BLEND = _env_int("LAM_LOG_BLEND", 1)
 
 # ===== Picks 导出配置 =====
 EXPORT_PICKS = 1
@@ -240,6 +280,319 @@ def estimate_corners_lambda_total(h_stats: dict, a_stats: dict, lam_home: float,
     if h_c_home and a_c_away and h_c_home > 0 and a_c_away > 0:
         return float(h_c_home + a_c_away)
     return float(CORNER_BASE + CORNER_PER_GOAL * (lam_home + lam_away))
+
+# ================== λ 多模型融合 ==================
+RECENT_FORM_CACHE: dict[tuple[int, int, int, int], List[Dict]] = {}
+
+def _safe_stat(path: List[str], data: dict, default: float) -> float:
+    cur = data or {}
+    for key in path:
+        if not isinstance(cur, dict):
+            return float(default)
+        cur = cur.get(key)
+        if cur is None:
+            return float(default)
+    try:
+        return float(cur)
+    except Exception:
+        return float(default)
+
+def _fixture_timestamp(fixture: Dict) -> float:
+    info = (fixture or {}).get("fixture") or {}
+    ts = info.get("timestamp")
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    date_str = info.get("date")
+    if isinstance(date_str, str):
+        try:
+            if date_str.endswith("Z"):
+                date_str = date_str[:-1] + "+00:00"
+            return datetime.fromisoformat(date_str).timestamp()
+        except Exception:
+            pass
+    return 0.0
+
+def _recent_weighted_avg(fixtures: List[Dict], team_id: int, want_home: bool, max_games: int, decay: float) -> tuple[Optional[float], Optional[float], int]:
+    if max_games <= 0:
+        return None, None, 0
+    entries: List[tuple[float, float, float]] = []
+    for fx in fixtures or []:
+        teams = fx.get("teams") or {}
+        home = (teams.get("home") or {}).get("id")
+        away = (teams.get("away") or {}).get("id")
+        if want_home:
+            if home != team_id:
+                continue
+            g_for = (fx.get("goals") or {}).get("home")
+            g_against = (fx.get("goals") or {}).get("away")
+        else:
+            if away != team_id:
+                continue
+            g_for = (fx.get("goals") or {}).get("away")
+            g_against = (fx.get("goals") or {}).get("home")
+        if g_for is None or g_against is None:
+            score_ft = ((fx.get("score") or {}).get("fulltime") or {})
+            if g_for is None:
+                g_for = score_ft.get("home" if want_home else "away")
+            if g_against is None:
+                g_against = score_ft.get("away" if want_home else "home")
+        try:
+            gf_val = float(g_for)
+            ga_val = float(g_against)
+        except (TypeError, ValueError):
+            continue
+        entries.append((_fixture_timestamp(fx), gf_val, ga_val))
+
+    if not entries:
+        return None, None, 0
+
+    entries.sort(key=lambda x: x[0], reverse=True)
+    try:
+        decay_val = float(decay)
+    except Exception:
+        decay_val = 0.85
+    if decay_val <= 0:
+        decay_val = 0.85
+    if decay_val > 1:
+        decay_val = 1.0
+
+    weight_sum = 0.0
+    gf_sum = 0.0
+    ga_sum = 0.0
+    used = 0
+    for _, gf_val, ga_val in entries:
+        weight = decay_val ** used
+        gf_sum += weight * gf_val
+        ga_sum += weight * ga_val
+        weight_sum += weight
+        used += 1
+        if used >= max_games:
+            break
+
+    if weight_sum <= 0:
+        return None, None, used
+
+    return gf_sum / weight_sum, ga_sum / weight_sum, used
+
+def fetch_recent_form(team_id: int, league_id: int, season: int, fetch_last: int) -> List[Dict]:
+    key = (league_id, season, team_id, fetch_last)
+    if key in RECENT_FORM_CACHE:
+        return RECENT_FORM_CACHE[key]
+    try:
+        fixtures = recent_fixtures_by_team(team_id=team_id, season=season, last=fetch_last, league_id=league_id)
+    except Exception as e:
+        fixtures = []
+        if LOG_LAMBDA_BLEND:
+            print(f"[λ模型] 获取近况赛程失败 team={team_id}: {e}")
+    RECENT_FORM_CACHE[key] = fixtures or []
+    return RECENT_FORM_CACHE[key]
+
+def _blend_recent_value(recent_val: Optional[float], fallback_val: float, mix: float) -> float:
+    if fallback_val is None and recent_val is None:
+        return 0.0
+    if recent_val is None:
+        return float(fallback_val)
+    if fallback_val is None:
+        return float(recent_val)
+    mix_clamped = max(0.0, min(1.0, float(mix)))
+    return float(mix_clamped * float(fallback_val) + (1.0 - mix_clamped) * float(recent_val))
+
+def lambda_from_season_stats(h_stats: dict, a_stats: dict, league_avg: float, home_adv: float) -> tuple[tuple[float, float], dict]:
+    denom = max(float(league_avg or 0.0), 1e-6)
+    h_gf_home = _safe_stat(["goals","for","average","home"], h_stats, 1.3)
+    h_ga_home = _safe_stat(["goals","against","average","home"], h_stats, 1.3)
+    a_gf_away = _safe_stat(["goals","for","average","away"], a_stats, 1.3)
+    a_ga_away = _safe_stat(["goals","against","average","away"], a_stats, 1.3)
+
+    h_att = max(0.05, h_gf_home) / denom
+    h_def = max(0.05, h_ga_home) / denom
+    a_att = max(0.05, a_gf_away) / denom
+    a_def = max(0.05, a_ga_away) / denom
+
+    lam_home, lam_away = expected_goals_from_strengths(h_att, a_def, a_att, h_def, league_avg, home_adv)
+    meta = {
+        "h_att": float(h_att),
+        "h_def": float(h_def),
+        "a_att": float(a_att),
+        "a_def": float(a_def),
+        "h_for_avg": float(h_gf_home),
+        "h_against_avg": float(h_ga_home),
+        "a_for_avg": float(a_gf_away),
+        "a_against_avg": float(a_ga_away),
+    }
+    return (float(lam_home), float(lam_away)), meta
+
+def lambda_from_recent_form(
+    home_id: int,
+    away_id: int,
+    league_id: int,
+    season: int,
+    league_avg: float,
+    home_adv: float,
+    season_meta: dict,
+    config: dict,
+) -> tuple[tuple[float, float], dict]:
+    recent_games = max(1, int(config.get("recent_games", 6)))
+    min_games = max(1, int(config.get("min_games", 3)))
+    if min_games > recent_games:
+        min_games = recent_games
+    try:
+        decay = float(config.get("decay", 0.85))
+    except Exception:
+        decay = 0.85
+    fetch_last = int(config.get("fetch_last", recent_games))
+    fetch_last = max(fetch_last, recent_games * 2)
+
+    home_fixtures = fetch_recent_form(home_id, league_id, season, fetch_last)
+    away_fixtures = fetch_recent_form(away_id, league_id, season, fetch_last)
+
+    h_recent_for, h_recent_against, cnt_home = _recent_weighted_avg(home_fixtures, home_id, True, recent_games, decay)
+    a_recent_for, a_recent_against, cnt_away = _recent_weighted_avg(away_fixtures, away_id, False, recent_games, decay)
+
+    coverage_home = min(1.0, cnt_home / recent_games) if recent_games else 0.0
+    coverage_away = min(1.0, cnt_away / recent_games) if recent_games else 0.0
+
+    try:
+        base_mix = float(config.get("season_mix", 0.3))
+    except Exception:
+        base_mix = 0.3
+    base_mix = max(0.0, min(1.0, base_mix))
+
+    def _effective_mix(base: float, coverage: float, enough_games: bool) -> float:
+        if not enough_games:
+            return 1.0
+        return base + (1.0 - coverage) * (1.0 - base)
+
+    eff_mix_home = _effective_mix(base_mix, coverage_home, cnt_home >= min_games)
+    eff_mix_away = _effective_mix(base_mix, coverage_away, cnt_away >= min_games)
+
+    fallback_h_for = max(0.05, float(season_meta.get("h_for_avg", league_avg)))
+    fallback_h_against = max(0.05, float(season_meta.get("h_against_avg", league_avg)))
+    fallback_a_for = max(0.05, float(season_meta.get("a_for_avg", league_avg)))
+    fallback_a_against = max(0.05, float(season_meta.get("a_against_avg", league_avg)))
+
+    h_for_blend = max(0.05, _blend_recent_value(h_recent_for, fallback_h_for, eff_mix_home))
+    h_against_blend = max(0.05, _blend_recent_value(h_recent_against, fallback_h_against, eff_mix_home))
+    a_for_blend = max(0.05, _blend_recent_value(a_recent_for, fallback_a_for, eff_mix_away))
+    a_against_blend = max(0.05, _blend_recent_value(a_recent_against, fallback_a_against, eff_mix_away))
+
+    denom = max(float(league_avg or 0.0), 1e-6)
+    h_att = h_for_blend / denom
+    h_def = h_against_blend / denom
+    a_att = a_for_blend / denom
+    a_def = a_against_blend / denom
+
+    lam_home, lam_away = expected_goals_from_strengths(h_att, a_def, a_att, h_def, league_avg, home_adv)
+    meta = {
+        "home_games_used": int(cnt_home),
+        "away_games_used": int(cnt_away),
+        "home_recent_for": None if h_recent_for is None else float(h_recent_for),
+        "home_recent_against": None if h_recent_against is None else float(h_recent_against),
+        "away_recent_for": None if a_recent_for is None else float(a_recent_for),
+        "away_recent_against": None if a_recent_against is None else float(a_recent_against),
+        "home_eff_mix": float(eff_mix_home),
+        "away_eff_mix": float(eff_mix_away),
+    }
+    return (float(lam_home), float(lam_away)), meta
+
+def compute_lambda_models(
+    league_id: int,
+    season: int,
+    home_id: int,
+    away_id: int,
+    h_stats: dict,
+    a_stats: dict,
+    league_avg: float,
+) -> Dict[str, dict]:
+    models: Dict[str, dict] = {}
+    (lam_season, lam_season_away), season_meta = lambda_from_season_stats(h_stats, a_stats, league_avg, HOME_ADV)
+    models["season"] = {
+        "lam_home": lam_season,
+        "lam_away": lam_season_away,
+        "meta": season_meta,
+    }
+
+    recent_cfg = LAMBDA_MODEL_CONFIG.get("recent") or {}
+    if float(recent_cfg.get("weight", 0.0)) > 0:
+        try:
+            (lam_recent, lam_recent_away), recent_meta = lambda_from_recent_form(
+                home_id, away_id, league_id, season, league_avg, HOME_ADV, season_meta, recent_cfg
+            )
+            models["recent"] = {
+                "lam_home": lam_recent,
+                "lam_away": lam_recent_away,
+                "meta": recent_meta,
+            }
+        except Exception as e:
+            if LOG_LAMBDA_BLEND:
+                print(f"[λ模型] 近况模型计算失败 {home_id}-{away_id}: {e}")
+    return models
+
+def blend_lambda_models(models: Dict[str, dict], config: Dict[str, dict]) -> tuple[float, float, Dict[str, float]]:
+    valid = {
+        name: data
+        for name, data in models.items()
+        if isinstance(data, dict) and data.get("lam_home") is not None and data.get("lam_away") is not None
+    }
+    if not valid:
+        raise RuntimeError("无可用 λ 模型")
+
+    weights_used: Dict[str, float] = {}
+    weighted_home = 0.0
+    weighted_away = 0.0
+    for name, data in valid.items():
+        weight = float((config.get(name) or {}).get("weight", 0.0))
+        if weight <= 0:
+            continue
+        lam_h = float(data.get("lam_home", 0.0))
+        lam_a = float(data.get("lam_away", 0.0))
+        weights_used[name] = weight
+        weighted_home += weight * lam_h
+        weighted_away += weight * lam_a
+
+    if not weights_used:
+        first_name, data = next(iter(valid.items()))
+        fallback_weights = {name: (1.0 if name == first_name else 0.0) for name in valid}
+        return float(data.get("lam_home", 1.4)), float(data.get("lam_away", 1.1)), fallback_weights
+
+    total_weight = sum(weights_used.values()) or 1.0
+    lam_home = weighted_home / total_weight
+    lam_away = weighted_away / total_weight
+    normalized = {name: (weights_used.get(name, 0.0) / total_weight) for name in valid}
+    return float(lam_home), float(lam_away), normalized
+
+def format_lambda_detail(models: Dict[str, dict], weights: Dict[str, float]) -> str:
+    parts: List[str] = []
+    for name, data in models.items():
+        lam_h = data.get("lam_home")
+        lam_a = data.get("lam_away")
+        if lam_h is None or lam_a is None:
+            continue
+        weight = weights.get(name, 0.0)
+        parts.append(f"{name}:{float(lam_h):.3f}/{float(lam_a):.3f} (w={weight:.2f})")
+    return " | ".join(parts)
+
+def log_lambda_blend(home_name: str, away_name: str, models: Dict[str, dict], weights: Dict[str, float], lam_home: float, lam_away: float) -> None:
+    entries = []
+    for name, data in models.items():
+        lam_h = data.get("lam_home")
+        lam_a = data.get("lam_away")
+        if lam_h is None or lam_a is None:
+            continue
+        raw_weight = float((LAMBDA_MODEL_CONFIG.get(name) or {}).get("weight", 0.0))
+        norm_weight = weights.get(name, 0.0)
+        meta = data.get("meta") or {}
+        extra = ""
+        if name == "recent":
+            extra = (
+                f" cntH={meta.get('home_games_used', 0)} cntA={meta.get('away_games_used', 0)}"
+                f" mixH={meta.get('home_eff_mix', 0):.2f} mixA={meta.get('away_eff_mix', 0):.2f}"
+            )
+        entries.append(
+            f"{name}:λ=({float(lam_h):.2f},{float(lam_a):.2f}) w_cfg={raw_weight:.2f} w_norm={norm_weight:.2f}{extra}"
+        )
+    detail = " | ".join(entries)
+    print(f"[λ模型] {home_name} vs {away_name} -> {detail} => blend=({lam_home:.2f},{lam_away:.2f})")
 
 # ================== 打印 & 导出工具 ==================
 def _fmt_ou_book(line, odds, is_corner=False):
@@ -505,24 +858,19 @@ def main():
         h_st = TEAM_STATS_CACHE.get((league_id, season, home_id), {}) or {}
         a_st = TEAM_STATS_CACHE.get((league_id, season, away_id), {}) or {}
 
-        def _safe(path, d, default):
-            cur = d
-            for k in path:
-                cur = (cur or {}).get(k)
-                if cur is None: return default
-            try: return float(cur) if cur else default
-            except: return default
-
-        h_gf_home = _safe(["goals","for","average","home"], h_st, 1.3)
-        h_ga_home = _safe(["goals","against","average","home"], h_st, 1.3)
-        a_gf_away = _safe(["goals","for","average","away"], a_st, 1.3)
-        a_ga_away = _safe(["goals","against","average","away"], a_st, 1.3)
-
-        denom = max(league_avg, 1e-6)
-        h_att = h_gf_home / denom; h_def = h_ga_home / denom
-        a_att = a_gf_away / denom; a_def = a_ga_away / denom
-
-        lam_home, lam_away = expected_goals_from_strengths(h_att, a_def, a_att, h_def, league_avg, HOME_ADV)
+        lambda_models = compute_lambda_models(
+            league_id=league_id,
+            season=season,
+            home_id=home_id,
+            away_id=away_id,
+            h_stats=h_st,
+            a_stats=a_st,
+            league_avg=league_avg,
+        )
+        lam_home, lam_away, lam_weights = blend_lambda_models(lambda_models, LAMBDA_MODEL_CONFIG)
+        lam_detail = format_lambda_detail(lambda_models, lam_weights)
+        if LOG_LAMBDA_BLEND:
+            log_lambda_blend(home_name, away_name, lambda_models, lam_weights, lam_home, lam_away)
 
         sim = monte_carlo_simulate(lam_home, lam_away, n_sims=N_SIMS_GOALS, over_line=2.5)
         _, _, totals = simulate_goals(lam_home, lam_away, n_sims=N_SIMS_GOALS)
@@ -755,10 +1103,16 @@ def main():
         best_kelly = cands[0][3] if cands else None
 
         # ===== 写行 =====
-        rows_all.append({
+        weight_fields = {
+            f"lam_weight_{name}": round(lam_weights.get(name, 0.0), 3)
+            for name, data in lambda_models.items()
+            if data.get("lam_home") is not None and data.get("lam_away") is not None
+        }
+
+        row = {
             "date_utc": date_str, "kickoff_utc": kickoff_utc, "league": league_name,
             "home": home_name, "away": away_name,
-            "lam_home": round(sim["lam_home"],3), "lam_away": round(sim["lam_away"],3),
+            "lam_home": round(lam_home,3), "lam_away": round(lam_away,3),
             "p_home": round(sim["p_home"],4), "p_draw": round(sim["p_draw"],4), "p_away": round(sim["p_away"],4),
             "p_over2.5": round(sim["p_over"],4), "p_under2.5": round(sim["p_under"],4),
 
@@ -793,7 +1147,14 @@ def main():
 
             "best_market": best_label, "best_ev": best_ev, "best_kelly": best_kelly,
             "value_index": value_index(best_ev, best_kelly) if (best_ev is not None and best_kelly is not None) else None
-        })
+        }
+
+        if lam_detail:
+            row["lam_blend_detail"] = lam_detail
+        for k, v in weight_fields.items():
+            row[k] = v
+
+        rows_all.append(row)
 
         done += 1
         if done % 30 == 0 or done == len(fixtures):
@@ -804,7 +1165,8 @@ def main():
     out_file = os.path.join(out_dir, f"daily_brief_{date_str}.csv")
     base_order = [
         "date_utc","kickoff_utc","league","home","away",
-        "lam_home","lam_away","p_home","p_draw","p_away","p_over2.5","p_under2.5",
+        "lam_home","lam_away","lam_weight_season","lam_weight_recent","lam_blend_detail",
+        "p_home","p_draw","p_away","p_over2.5","p_under2.5",
         "ou_main_line","odds_ou_main_over","odds_ou_main_under",
         "ou_main_over_cnt","ou_main_under_cnt","ou_main_overround",
         "ev_ou_main_over","kelly_ou_main_over","ev_ou_main_under","kelly_ou_main_under",
