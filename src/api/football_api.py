@@ -146,6 +146,17 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
     def is_asian_handicap(name: str) -> bool:
         n = (name or "").lower()
         if "asian handicap" in n or ("handicap" in n and "european" not in n):
+            forbid = [
+                "1st half",
+                "first half",
+                "2nd half",
+                "second half",
+                "half time",
+                "half-time",
+                "halftime",
+            ]
+            if any(term in n for term in forbid):
+                return False
             return "corner" not in n and "cards" not in n and "booking" not in n
         return False
 
@@ -226,11 +237,23 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                         line = _parse_float(v.get("handicap"))
                         if side_txt not in ("home","away") or line is None or odd is None:
                             continue
-                        home_line = float(line) if side_txt == "home" else -float(line)
-                        if 1.10 <= odd <= 50.0:
-                            ah_map.setdefault(home_line, {"home": [], "away": []})
-                            if side_txt == "home": ah_map[home_line]["home"].append(odd)
-                            else:                  ah_map[home_line]["away"].append(odd)
+                        if not (1.10 <= odd <= 50.0):
+                            continue
+
+                        line_val = float(line)
+                        # Reuse existing keys so that Home/Away selections from the same
+                        # bookmaker line land in the same entry (处理正负盘符). This fixes
+                        # cases where one side was inserted first with the opposite sign.
+                        resolved_line: Optional[float] = None
+                        for cand in (line_val, -line_val):
+                            if cand in ah_map:
+                                resolved_line = cand
+                                break
+                        if resolved_line is None:
+                            resolved_line = line_val if side_txt == "home" else -line_val
+
+                        ah_map.setdefault(resolved_line, {"home": [], "away": []})
+                        ah_map[resolved_line][side_txt].append(odd)
 
     out: Dict[str, float] = {}
 
