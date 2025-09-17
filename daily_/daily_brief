@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 # —— 项目内模块
-from src.api.football_api import fixtures_by_date, team_statistics, odds_by_fixture
+from src.api.football_api import fixtures_by_date, team_statistics, odds_by_fixture, recent_fixtures_by_team
 from src.data.transform import league_goal_averages
 from src.models.poisson_mc import expected_goals_from_strengths, monte_carlo_simulate, simulate_goals
 from src.markets.asian_handicap import ah_probabilities_from_lams, ah_ev_kelly
@@ -45,6 +45,46 @@ MIN_EV = 0.00
 CORNER_BASE = 7.5
 CORNER_PER_GOAL = 0.9
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        raw = os.getenv(name)
+        if raw is None or raw == "":
+            return float(default)
+        return float(raw)
+    except Exception:
+        return float(default)
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        raw = os.getenv(name)
+        if raw is None or raw == "":
+            return int(default)
+        return int(float(raw))
+    except Exception:
+        return int(default)
+
+LAMBDA_MODEL_CONFIG = {
+    "season": {
+        "weight": _env_float("LAM_WEIGHT_SEASON", 0.6),
+    },
+    "recent": {
+        "weight": _env_float("LAM_WEIGHT_RECENT", 0.4 if USE_RECENT else 0.0),
+        "recent_games": _env_int("LAM_RECENT_GAMES", 6),
+        "min_games": _env_int("LAM_RECENT_MIN_GAMES", 3),
+        "decay": _env_float("LAM_RECENT_DECAY", 0.85),
+        "fetch_last": _env_int("LAM_RECENT_FETCH_LAST", 12),
+        "season_mix": _env_float("LAM_RECENT_SEASON_MIX", 0.3),
+    },
+}
+
+if LAMBDA_MODEL_CONFIG["recent"]["min_games"] > LAMBDA_MODEL_CONFIG["recent"]["recent_games"]:
+    LAMBDA_MODEL_CONFIG["recent"]["min_games"] = LAMBDA_MODEL_CONFIG["recent"]["recent_games"]
+
+if LAMBDA_MODEL_CONFIG["recent"]["fetch_last"] < LAMBDA_MODEL_CONFIG["recent"]["recent_games"]:
+    LAMBDA_MODEL_CONFIG["recent"]["fetch_last"] = LAMBDA_MODEL_CONFIG["recent"]["recent_games"]
+
+LOG_LAMBDA_BLEND = _env_int("LAM_LOG_BLEND", 1)
+
 # ===== Picks 导出配置 =====
 EXPORT_PICKS = 1
 PICKS_TOP_N = 100
@@ -54,6 +94,20 @@ PICKS_MIN_VI = 0.00
 KELLY_FRACTION = 0.25
 STAKE_CAP_PCT = 2.0
 STAKE_MIN_PCT = 0.0
+
+# ===== λ 安全带 & 市场融合参数 =====
+LAM_MIN_PER_TEAM = _env_float("LAM_MIN_PER_TEAM", 0.2)
+LAM_MAX_PER_TEAM = _env_float("LAM_MAX_PER_TEAM", 3.0)
+LAM_MIN_TOTAL    = _env_float("LAM_MIN_TOTAL", 1.6)
+LAM_MAX_TOTAL    = _env_float("LAM_MAX_TOTAL", 5.4)
+LAM_MARKET_BLEND_MIN_ALPHA = _env_float("LAM_MARKET_BLEND_MIN_ALPHA", 0.35)
+LAM_MARKET_BLEND_MAX_ALPHA = _env_float("LAM_MARKET_BLEND_MAX_ALPHA", 0.85)
+LAM_MARKET_DELTA_CAP       = _env_float("LAM_MARKET_DELTA_CAP", 1.8)
+
+# ===== 盘口质量过滤参数 =====
+ALLLINE_MAX_GAP = _env_float("ALLLINE_MAX_GAP", 3.0)
+CRN_LOW_LINE_SANITY = _env_float("CRN_LOW_LINE_SANITY", 4.5)
+CRN_LOW_LINE_OVER_FLOOR = _env_float("CRN_LOW_LINE_OVER_FLOOR", 0.55)
 
 # ================== 工具函数 ==================
 def _today_utc_date() -> str:
@@ -87,6 +141,270 @@ def ev_kelly_binary(p: float, odds: float) -> Tuple[float, float]:
 def value_index(ev: float | None, kelly: float | None) -> float:
     if ev is None or kelly is None: return -999.0
     return float(ev * math.sqrt(max(0.0, kelly)))
+
+
+def _clamp_lambdas(lam_home: float, lam_away: float) -> tuple[float, float]:
+    """Apply soft bounds to individual and total λ values."""
+    lam_home = float(max(LAM_MIN_PER_TEAM, min(LAM_MAX_PER_TEAM, lam_home)))
+    lam_away = float(max(LAM_MIN_PER_TEAM, min(LAM_MAX_PER_TEAM, lam_away)))
+    total = lam_home + lam_away
+    if total <= 0:
+        lam_home = lam_away = LAM_MIN_TOTAL / 2.0
+        total = lam_home + lam_away
+    ratio_home = lam_home / total if total > 0 else 0.5
+    total_clamped = float(max(LAM_MIN_TOTAL, min(LAM_MAX_TOTAL, total)))
+    lam_home = ratio_home * total_clamped
+    lam_away = total_clamped - lam_home
+    lam_home = float(max(LAM_MIN_PER_TEAM, min(LAM_MAX_PER_TEAM, lam_home)))
+    lam_away = float(max(LAM_MIN_PER_TEAM, min(LAM_MAX_PER_TEAM, lam_away)))
+    total = lam_home + lam_away
+    if total < LAM_MIN_TOTAL:
+        deficit = LAM_MIN_TOTAL - total
+        lam_home = float(min(LAM_MAX_PER_TEAM, lam_home + deficit * ratio_home))
+        lam_away = float(min(LAM_MAX_PER_TEAM, lam_away + deficit * (1.0 - ratio_home)))
+    total = lam_home + lam_away
+    if total > LAM_MAX_TOTAL and total > 0:
+        scale = LAM_MAX_TOTAL / total
+        lam_home = float(max(LAM_MIN_PER_TEAM, min(LAM_MAX_PER_TEAM, lam_home * scale)))
+        lam_away = float(max(LAM_MIN_PER_TEAM, min(LAM_MAX_PER_TEAM, lam_away * scale)))
+    return float(lam_home), float(lam_away)
+
+
+def _lambda_model_quality(name: str, data: dict, config: Dict[str, dict]) -> float:
+    meta = (data or {}).get("meta") or {}
+    if name == "recent":
+        cfg = config.get("recent") or {}
+        target = max(1, int(cfg.get("recent_games", 6))) * 2
+        used = float(meta.get("home_games_used", 0) or 0) + float(meta.get("away_games_used", 0) or 0)
+        if target <= 0:
+            target = 6.0
+        coverage = max(0.0, min(1.0, used / float(target)))
+        return 0.2 + 0.8 * coverage
+    return 1.0
+
+
+def lambda_coverage_score(models: Dict[str, dict], weights: Dict[str, float], config: Dict[str, dict]) -> float:
+    if not weights:
+        return 0.0
+    score = 0.0
+    total_weight = 0.0
+    for name, data in models.items():
+        weight = float(weights.get(name, 0.0))
+        if weight <= 0:
+            continue
+        score += weight * _lambda_model_quality(name, data, config)
+        total_weight += weight
+    if total_weight <= 0:
+        return 0.0
+    return max(0.0, min(1.0, score / total_weight))
+
+
+def _implied_prob_over(odds_over: float, odds_under: float) -> Optional[float]:
+    try:
+        inv_over = 1.0 / float(odds_over)
+        inv_under = 1.0 / float(odds_under)
+        total = inv_over + inv_under
+        if total <= 0:
+            return None
+        return float(inv_over / total)
+    except Exception:
+        return None
+
+
+def _poisson_tail_ge(k: int, lam: float) -> float:
+    if k <= 0:
+        return 1.0
+    pmf = math.exp(-lam)
+    s = pmf
+    for n in range(1, k):
+        pmf *= lam / n
+        s += pmf
+    return max(0.0, 1.0 - s)
+
+
+def _poisson_cum_le(k: int, lam: float) -> float:
+    if k < 0:
+        return 0.0
+    pmf = math.exp(-lam)
+    s = pmf
+    for n in range(1, k + 1):
+        pmf *= lam / n
+        s += pmf
+    return min(1.0, s)
+
+
+def _poisson_over_under_prob(line: float, lam_total: float) -> tuple[float, float]:
+    base = math.floor(float(line) + 1e-9)
+    frac = round(float(line) - base, 2)
+    if frac == 0.0:
+        return _poisson_tail_ge(base + 1, lam_total), _poisson_cum_le(base - 1, lam_total)
+    if frac == 0.5:
+        return _poisson_tail_ge(base + 1, lam_total), _poisson_cum_le(base, lam_total)
+    if frac == 0.25:
+        over = 0.5 * _poisson_tail_ge(base + 1, lam_total) + 0.5 * _poisson_tail_ge(base + 1, lam_total)
+        under = 0.5 * _poisson_cum_le(base - 1, lam_total) + 0.5 * _poisson_cum_le(base, lam_total)
+        return over, under
+    if frac == 0.75:
+        over = 0.5 * _poisson_tail_ge(base + 1, lam_total) + 0.5 * _poisson_tail_ge(base + 2, lam_total)
+        under = 0.5 * _poisson_cum_le(base, lam_total) + 0.5 * _poisson_cum_le(base + 1, lam_total)
+        return over, under
+    nearest_half = base + (0.5 if frac < 0.5 else 1.5)
+    return _poisson_over_under_prob(nearest_half, lam_total)
+
+
+def _solve_total_lambda(line: float, target_prob: float, initial_total: float) -> Optional[float]:
+    if line is None or target_prob is None:
+        return None
+    try:
+        line_f = float(line)
+    except Exception:
+        return None
+    target = float(target_prob)
+    if not (0.01 <= target <= 0.99):
+        return None
+    low, high = 0.2, 8.0
+    for _ in range(40):
+        mid = 0.5 * (low + high)
+        p_over, _ = _poisson_over_under_prob(line_f, mid)
+        if p_over is None:
+            break
+        if p_over > target:
+            high = mid
+        else:
+            low = mid
+    cand = 0.5 * (low + high)
+    if not math.isfinite(cand):
+        return None
+    # Limit runaway solutions relative to the initial guess
+    if initial_total is not None:
+        delta_cap = max(0.5, LAM_MARKET_DELTA_CAP)
+        diff = cand - float(initial_total)
+        if abs(diff) > delta_cap:
+            cand = float(initial_total) + math.copysign(delta_cap, diff)
+    return float(max(LAM_MIN_TOTAL / 2.0, min(LAM_MAX_TOTAL * 1.1, cand)))
+
+
+def adjust_lambdas_with_guards(
+    lam_home: float,
+    lam_away: float,
+    odds: dict,
+    coverage: float,
+    notes: Optional[List[str]] = None,
+) -> tuple[float, float, Optional[float], List[str]]:
+    notes_list: List[str] = [] if notes is None else notes
+    base_home, base_away = lam_home, lam_away
+    lam_home, lam_away = _clamp_lambdas(lam_home, lam_away)
+    if abs(lam_home - base_home) > 1e-6 or abs(lam_away - base_away) > 1e-6:
+        notes_list.append(
+            f"clamp:{base_home:.2f}/{base_away:.2f}->{lam_home:.2f}/{lam_away:.2f}"
+        )
+    market_total = None
+    ou_line = (odds or {}).get("ou_main_line")
+    ou_over = (odds or {}).get("ou_main_over")
+    ou_under = (odds or {}).get("ou_main_under")
+    overround = (odds or {}).get("ou_main_overround")
+    pair = sanitize_ou_pair(ou_over, ou_under)
+    if pair and ou_line is not None:
+        oo, uu = pair
+        if overround is None or float(overround) <= 1.22:
+            p_market = _implied_prob_over(oo, uu)
+            if p_market is not None:
+                model_total = lam_home + lam_away
+                market_total = _solve_total_lambda(float(ou_line), p_market, model_total)
+                if market_total is not None:
+                    coverage = max(0.0, min(1.0, float(coverage)))
+                    alpha = LAM_MARKET_BLEND_MIN_ALPHA + (
+                        (LAM_MARKET_BLEND_MAX_ALPHA - LAM_MARKET_BLEND_MIN_ALPHA) * coverage
+                    )
+                    alpha = max(0.0, min(1.0, alpha))
+                    blended_total = alpha * model_total + (1.0 - alpha) * market_total
+                    if model_total > 0:
+                        ratio = lam_home / model_total
+                    else:
+                        ratio = 0.5
+                    lam_home = ratio * blended_total
+                    lam_away = blended_total - lam_home
+                    notes_list.append(
+                        f"market_blend:{model_total:.2f}->{blended_total:.2f}(α={alpha:.2f})"
+                    )
+    lam_home, lam_away = _clamp_lambdas(lam_home, lam_away)
+    return float(lam_home), float(lam_away), market_total, notes_list
+
+
+def blend_probabilities_with_market(
+    model_probs: Dict[str, float], market_probs: Dict[str, float], alpha: float
+) -> Dict[str, float]:
+    keys = ["p_home", "p_draw", "p_away"]
+    out = {}
+    alpha = max(0.0, min(1.0, float(alpha)))
+    for k in keys:
+        out[k] = alpha * float(model_probs.get(k, 0.0)) + (1.0 - alpha) * float(market_probs.get(k, 0.0))
+    total = sum(out.values())
+    if total <= 0:
+        return {k: (1.0 / 3.0) for k in keys}
+    return {k: out[k] / total for k in keys}
+
+
+def apply_draw_inflation(probs: Dict[str, float], boost: float) -> Dict[str, float]:
+    boost = max(0.0, float(boost))
+    p_draw = float(probs.get("p_draw", 0.0))
+    p_home = float(probs.get("p_home", 0.0))
+    p_away = float(probs.get("p_away", 0.0))
+    if p_draw <= 0 or (p_home + p_away) <= 0:
+        return {"p_home": p_home, "p_draw": p_draw, "p_away": p_away}
+    new_draw = min(0.62, p_draw * (1.0 + boost))
+    scale = (1.0 - new_draw) / max(1e-9, (1.0 - p_draw))
+    p_home *= scale
+    p_away *= scale
+    total = p_home + new_draw + p_away
+    if total <= 0:
+        return {"p_home": 0.34, "p_draw": 0.32, "p_away": 0.34}
+    return {
+        "p_home": p_home / total,
+        "p_draw": new_draw / total,
+        "p_away": p_away / total,
+    }
+
+
+def _assess_ou_main(cnt_over: int, cnt_under: int, overround: Optional[float], strict: int) -> tuple[bool, str, Optional[float]]:
+    if not strict:
+        return True, "ok", None
+    cnt_over = int(cnt_over or 0)
+    cnt_under = int(cnt_under or 0)
+    min_cnt = min(cnt_over, cnt_under)
+    if min_cnt < 2:
+        return False, "cnt_low", None
+    if min_cnt >= 4:
+        max_or = 1.12
+    elif min_cnt >= 3:
+        max_or = 1.15
+    else:
+        max_or = 1.18
+    if overround is not None and overround > max_or:
+        return False, "overround_high", max_or
+    return True, "ok", max_or
+
+
+def _adjust_corner_line_for_sanity(line: float, over: float, under: float) -> tuple[Optional[float], Optional[float], bool]:
+    try:
+        line_f = float(line)
+        over_f = float(over)
+        under_f = float(under)
+    except (TypeError, ValueError):
+        return None, None, False
+    direction_ok = True
+    if line_f <= CRN_LOW_LINE_SANITY and over_f > 1.0 and under_f > 1.0:
+        inv_over = 1.0 / over_f
+        inv_under = 1.0 / under_f
+        total = inv_over + inv_under
+        if total > 0:
+            prob_over = inv_over / total
+            prob_under = inv_under / total
+            if prob_over < CRN_LOW_LINE_OVER_FLOOR and prob_under > CRN_LOW_LINE_OVER_FLOOR:
+                over_f, under_f = under_f, over_f
+                prob_over, prob_under = prob_under, prob_over
+            direction_ok = prob_over >= CRN_LOW_LINE_OVER_FLOOR
+    return over_f, under_f, direction_ok
 
 # ===== 四分之一盘精结算（基于 totals 样本）=====
 def ou_ev_kelly_from_totals_quarter(line: float, over_odds: float, under_odds: float, totals) -> dict:
@@ -241,6 +559,329 @@ def estimate_corners_lambda_total(h_stats: dict, a_stats: dict, lam_home: float,
         return float(h_c_home + a_c_away)
     return float(CORNER_BASE + CORNER_PER_GOAL * (lam_home + lam_away))
 
+# ================== λ 多模型融合 ==================
+RECENT_FORM_CACHE: dict[tuple[int, int, int, int], List[Dict]] = {}
+
+def _safe_stat(path: List[str], data: dict, default: float) -> float:
+    cur = data or {}
+    for key in path:
+        if not isinstance(cur, dict):
+            return float(default)
+        cur = cur.get(key)
+        if cur is None:
+            return float(default)
+    try:
+        return float(cur)
+    except Exception:
+        return float(default)
+
+def _fixture_timestamp(fixture: Dict) -> float:
+    info = (fixture or {}).get("fixture") or {}
+    ts = info.get("timestamp")
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    date_str = info.get("date")
+    if isinstance(date_str, str):
+        try:
+            if date_str.endswith("Z"):
+                date_str = date_str[:-1] + "+00:00"
+            return datetime.fromisoformat(date_str).timestamp()
+        except Exception:
+            pass
+    return 0.0
+
+def _recent_weighted_avg(fixtures: List[Dict], team_id: int, want_home: bool, max_games: int, decay: float) -> tuple[Optional[float], Optional[float], int]:
+    if max_games <= 0:
+        return None, None, 0
+    entries: List[tuple[float, float, float]] = []
+    for fx in fixtures or []:
+        teams = fx.get("teams") or {}
+        home = (teams.get("home") or {}).get("id")
+        away = (teams.get("away") or {}).get("id")
+        if want_home:
+            if home != team_id:
+                continue
+            g_for = (fx.get("goals") or {}).get("home")
+            g_against = (fx.get("goals") or {}).get("away")
+        else:
+            if away != team_id:
+                continue
+            g_for = (fx.get("goals") or {}).get("away")
+            g_against = (fx.get("goals") or {}).get("home")
+        if g_for is None or g_against is None:
+            score_ft = ((fx.get("score") or {}).get("fulltime") or {})
+            if g_for is None:
+                g_for = score_ft.get("home" if want_home else "away")
+            if g_against is None:
+                g_against = score_ft.get("away" if want_home else "home")
+        try:
+            gf_val = float(g_for)
+            ga_val = float(g_against)
+        except (TypeError, ValueError):
+            continue
+        entries.append((_fixture_timestamp(fx), gf_val, ga_val))
+
+    if not entries:
+        return None, None, 0
+
+    entries.sort(key=lambda x: x[0], reverse=True)
+    try:
+        decay_val = float(decay)
+    except Exception:
+        decay_val = 0.85
+    if decay_val <= 0:
+        decay_val = 0.85
+    if decay_val > 1:
+        decay_val = 1.0
+
+    weight_sum = 0.0
+    gf_sum = 0.0
+    ga_sum = 0.0
+    used = 0
+    for _, gf_val, ga_val in entries:
+        weight = decay_val ** used
+        gf_sum += weight * gf_val
+        ga_sum += weight * ga_val
+        weight_sum += weight
+        used += 1
+        if used >= max_games:
+            break
+
+    if weight_sum <= 0:
+        return None, None, used
+
+    return gf_sum / weight_sum, ga_sum / weight_sum, used
+
+def fetch_recent_form(team_id: int, league_id: int, season: int, fetch_last: int) -> List[Dict]:
+    key = (league_id, season, team_id, fetch_last)
+    if key in RECENT_FORM_CACHE:
+        return RECENT_FORM_CACHE[key]
+    try:
+        fixtures = recent_fixtures_by_team(team_id=team_id, season=season, last=fetch_last, league_id=league_id)
+    except Exception as e:
+        fixtures = []
+        if LOG_LAMBDA_BLEND:
+            print(f"[λ模型] 获取近况赛程失败 team={team_id}: {e}")
+    RECENT_FORM_CACHE[key] = fixtures or []
+    return RECENT_FORM_CACHE[key]
+
+def _blend_recent_value(recent_val: Optional[float], fallback_val: float, mix: float) -> float:
+    if fallback_val is None and recent_val is None:
+        return 0.0
+    if recent_val is None:
+        return float(fallback_val)
+    if fallback_val is None:
+        return float(recent_val)
+    mix_clamped = max(0.0, min(1.0, float(mix)))
+    return float(mix_clamped * float(fallback_val) + (1.0 - mix_clamped) * float(recent_val))
+
+def lambda_from_season_stats(h_stats: dict, a_stats: dict, league_avg: float, home_adv: float) -> tuple[tuple[float, float], dict]:
+    denom = max(float(league_avg or 0.0), 1e-6)
+    h_gf_home = _safe_stat(["goals","for","average","home"], h_stats, 1.3)
+    h_ga_home = _safe_stat(["goals","against","average","home"], h_stats, 1.3)
+    a_gf_away = _safe_stat(["goals","for","average","away"], a_stats, 1.3)
+    a_ga_away = _safe_stat(["goals","against","average","away"], a_stats, 1.3)
+
+    h_att = max(0.05, h_gf_home) / denom
+    h_def = max(0.05, h_ga_home) / denom
+    a_att = max(0.05, a_gf_away) / denom
+    a_def = max(0.05, a_ga_away) / denom
+
+    lam_home, lam_away = expected_goals_from_strengths(h_att, a_def, a_att, h_def, league_avg, home_adv)
+    meta = {
+        "h_att": float(h_att),
+        "h_def": float(h_def),
+        "a_att": float(a_att),
+        "a_def": float(a_def),
+        "h_for_avg": float(h_gf_home),
+        "h_against_avg": float(h_ga_home),
+        "a_for_avg": float(a_gf_away),
+        "a_against_avg": float(a_ga_away),
+    }
+    return (float(lam_home), float(lam_away)), meta
+
+def lambda_from_recent_form(
+    home_id: int,
+    away_id: int,
+    league_id: int,
+    season: int,
+    league_avg: float,
+    home_adv: float,
+    season_meta: dict,
+    config: dict,
+) -> tuple[tuple[float, float], dict]:
+    recent_games = max(1, int(config.get("recent_games", 6)))
+    min_games = max(1, int(config.get("min_games", 3)))
+    if min_games > recent_games:
+        min_games = recent_games
+    try:
+        decay = float(config.get("decay", 0.85))
+    except Exception:
+        decay = 0.85
+    fetch_last = int(config.get("fetch_last", recent_games))
+    fetch_last = max(fetch_last, recent_games * 2)
+
+    home_fixtures = fetch_recent_form(home_id, league_id, season, fetch_last)
+    away_fixtures = fetch_recent_form(away_id, league_id, season, fetch_last)
+
+    h_recent_for, h_recent_against, cnt_home = _recent_weighted_avg(home_fixtures, home_id, True, recent_games, decay)
+    a_recent_for, a_recent_against, cnt_away = _recent_weighted_avg(away_fixtures, away_id, False, recent_games, decay)
+
+    coverage_home = min(1.0, cnt_home / recent_games) if recent_games else 0.0
+    coverage_away = min(1.0, cnt_away / recent_games) if recent_games else 0.0
+
+    try:
+        base_mix = float(config.get("season_mix", 0.3))
+    except Exception:
+        base_mix = 0.3
+    base_mix = max(0.0, min(1.0, base_mix))
+
+    def _effective_mix(base: float, coverage: float, enough_games: bool) -> float:
+        if not enough_games:
+            return 1.0
+        return base + (1.0 - coverage) * (1.0 - base)
+
+    eff_mix_home = _effective_mix(base_mix, coverage_home, cnt_home >= min_games)
+    eff_mix_away = _effective_mix(base_mix, coverage_away, cnt_away >= min_games)
+
+    fallback_h_for = max(0.05, float(season_meta.get("h_for_avg", league_avg)))
+    fallback_h_against = max(0.05, float(season_meta.get("h_against_avg", league_avg)))
+    fallback_a_for = max(0.05, float(season_meta.get("a_for_avg", league_avg)))
+    fallback_a_against = max(0.05, float(season_meta.get("a_against_avg", league_avg)))
+
+    h_for_blend = max(0.05, _blend_recent_value(h_recent_for, fallback_h_for, eff_mix_home))
+    h_against_blend = max(0.05, _blend_recent_value(h_recent_against, fallback_h_against, eff_mix_home))
+    a_for_blend = max(0.05, _blend_recent_value(a_recent_for, fallback_a_for, eff_mix_away))
+    a_against_blend = max(0.05, _blend_recent_value(a_recent_against, fallback_a_against, eff_mix_away))
+
+    denom = max(float(league_avg or 0.0), 1e-6)
+    h_att = h_for_blend / denom
+    h_def = h_against_blend / denom
+    a_att = a_for_blend / denom
+    a_def = a_against_blend / denom
+
+    lam_home, lam_away = expected_goals_from_strengths(h_att, a_def, a_att, h_def, league_avg, home_adv)
+    meta = {
+        "home_games_used": int(cnt_home),
+        "away_games_used": int(cnt_away),
+        "home_recent_for": None if h_recent_for is None else float(h_recent_for),
+        "home_recent_against": None if h_recent_against is None else float(h_recent_against),
+        "away_recent_for": None if a_recent_for is None else float(a_recent_for),
+        "away_recent_against": None if a_recent_against is None else float(a_recent_against),
+        "home_eff_mix": float(eff_mix_home),
+        "away_eff_mix": float(eff_mix_away),
+    }
+    return (float(lam_home), float(lam_away)), meta
+
+def compute_lambda_models(
+    league_id: int,
+    season: int,
+    home_id: int,
+    away_id: int,
+    h_stats: dict,
+    a_stats: dict,
+    league_avg: float,
+) -> Dict[str, dict]:
+    models: Dict[str, dict] = {}
+    (lam_season, lam_season_away), season_meta = lambda_from_season_stats(h_stats, a_stats, league_avg, HOME_ADV)
+    models["season"] = {
+        "lam_home": lam_season,
+        "lam_away": lam_season_away,
+        "meta": season_meta,
+    }
+
+    recent_cfg = LAMBDA_MODEL_CONFIG.get("recent") or {}
+    if float(recent_cfg.get("weight", 0.0)) > 0:
+        try:
+            (lam_recent, lam_recent_away), recent_meta = lambda_from_recent_form(
+                home_id, away_id, league_id, season, league_avg, HOME_ADV, season_meta, recent_cfg
+            )
+            models["recent"] = {
+                "lam_home": lam_recent,
+                "lam_away": lam_recent_away,
+                "meta": recent_meta,
+            }
+        except Exception as e:
+            if LOG_LAMBDA_BLEND:
+                print(f"[λ模型] 近况模型计算失败 {home_id}-{away_id}: {e}")
+    return models
+
+def blend_lambda_models(models: Dict[str, dict], config: Dict[str, dict]) -> tuple[float, float, Dict[str, float]]:
+    valid = {
+        name: data
+        for name, data in models.items()
+        if isinstance(data, dict) and data.get("lam_home") is not None and data.get("lam_away") is not None
+    }
+    if not valid:
+        raise RuntimeError("无可用 λ 模型")
+
+    weights_used: Dict[str, float] = {}
+    weighted_home = 0.0
+    weighted_away = 0.0
+    for name, data in valid.items():
+        weight_cfg = float((config.get(name) or {}).get("weight", 0.0))
+        if weight_cfg <= 0:
+            continue
+        quality = _lambda_model_quality(name, data, config)
+        effective_weight = weight_cfg * quality
+        if effective_weight <= 0:
+            continue
+        lam_h = float(data.get("lam_home", 0.0))
+        lam_a = float(data.get("lam_away", 0.0))
+        weights_used[name] = effective_weight
+        meta = data.setdefault("meta", {}) if isinstance(data, dict) else {}
+        if isinstance(meta, dict):
+            meta.setdefault("weight_cfg", weight_cfg)
+            meta.setdefault("quality", quality)
+        weighted_home += effective_weight * lam_h
+        weighted_away += effective_weight * lam_a
+
+    if not weights_used:
+        first_name, data = next(iter(valid.items()))
+        fallback_weights = {name: (1.0 if name == first_name else 0.0) for name in valid}
+        return float(data.get("lam_home", 1.4)), float(data.get("lam_away", 1.1)), fallback_weights
+
+    total_weight = sum(weights_used.values()) or 1.0
+    lam_home = weighted_home / total_weight
+    lam_away = weighted_away / total_weight
+    normalized = {name: (weights_used.get(name, 0.0) / total_weight) for name in valid}
+    return float(lam_home), float(lam_away), normalized
+
+def format_lambda_detail(models: Dict[str, dict], weights: Dict[str, float]) -> str:
+    parts: List[str] = []
+    for name, data in models.items():
+        lam_h = data.get("lam_home")
+        lam_a = data.get("lam_away")
+        if lam_h is None or lam_a is None:
+            continue
+        weight = weights.get(name, 0.0)
+        parts.append(f"{name}:{float(lam_h):.3f}/{float(lam_a):.3f} (w={weight:.2f})")
+    return " | ".join(parts)
+
+def log_lambda_blend(home_name: str, away_name: str, models: Dict[str, dict], weights: Dict[str, float], lam_home: float, lam_away: float) -> None:
+    entries = []
+    for name, data in models.items():
+        lam_h = data.get("lam_home")
+        lam_a = data.get("lam_away")
+        if lam_h is None or lam_a is None:
+            continue
+        cfg = LAMBDA_MODEL_CONFIG.get(name) or {}
+        raw_weight = float(cfg.get("weight", 0.0))
+        norm_weight = weights.get(name, 0.0)
+        meta = data.get("meta") or {}
+        quality = float(meta.get("quality", 1.0)) if meta else 1.0
+        extra = ""
+        if name == "recent":
+            extra = (
+                f" cntH={meta.get('home_games_used', 0)} cntA={meta.get('away_games_used', 0)}"
+                f" mixH={meta.get('home_eff_mix', 0):.2f} mixA={meta.get('away_eff_mix', 0):.2f}"
+            )
+        entries.append(
+            f"{name}:λ=({float(lam_h):.2f},{float(lam_a):.2f}) w_cfg={raw_weight:.2f} q={quality:.2f} w_norm={norm_weight:.2f}{extra}"
+        )
+    detail = " | ".join(entries)
+    print(f"[λ模型] {home_name} vs {away_name} -> {detail} => blend=({lam_home:.2f},{lam_away:.2f})")
+
 # ================== 打印 & 导出工具 ==================
 def _fmt_ou_book(line, odds, is_corner=False):
     if line is None or odds is None: return ""
@@ -257,15 +898,45 @@ def _fmt_ah_book(home_line, odds, side: str):
         return f"AH{sign}{ln_side:g}@{float(odds):.2f}"
     except: return ""
 
-def _stake_pct_from_kelly(k: Optional[float]) -> float:
+def _stake_pct_from_kelly(k: Optional[float], quality: float = 1.0) -> float:
     try:
         if k is None: return 0.0
-        pct = 100.0 * float(k) * float(KELLY_FRACTION)
+        pct = 100.0 * float(k) * float(KELLY_FRACTION) * max(0.0, float(quality))
         return float(min(STAKE_CAP_PCT, max(STAKE_MIN_PCT, round(pct, 2))))
     except: return 0.0
 
 def export_picks(rows_all: List[Dict], date_str: str):
     picks: List[Dict] = []
+    def _pick_quality(row: Dict, market: str) -> float:
+        coverage = float(row.get("lam_coverage") or 0.0)
+        quality = max(0.3, min(1.0, coverage if coverage > 0 else 0.3))
+        tag = (market or "").lower()
+        if tag.startswith("ou"):
+            if row.get("ou_main_reason") != "ok":
+                quality *= 0.5
+            depth = min(int(row.get("ou_main_over_cnt") or 0), int(row.get("ou_main_under_cnt") or 0))
+            if depth > 0:
+                quality *= min(1.0, max(0.5, depth / 4.0))
+            try:
+                or_val = float(row.get("ou_main_overround"))
+                quality *= max(0.5, min(1.0, 1.3 - or_val))
+            except (TypeError, ValueError):
+                pass
+        elif tag.startswith("ah"):
+            reason = str(row.get("ah_main_reason") or "").lower()
+            if not reason.startswith("ok"):
+                quality *= 0.5
+        elif tag.startswith("crn"):
+            depth = min(int(row.get("crn_main_over_cnt") or 0), int(row.get("crn_main_under_cnt") or 0))
+            if depth > 0:
+                quality *= min(1.0, max(0.5, depth / 4.0))
+            try:
+                or_val = float(row.get("crn_main_overround"))
+                quality *= max(0.5, min(1.0, 1.28 - or_val))
+            except (TypeError, ValueError):
+                pass
+        return max(0.2, min(1.0, quality))
+
     for r in rows_all:
         base = {"date_utc": r.get("date_utc"), "kickoff_utc": r.get("kickoff_utc"),
                 "league": r.get("league"), "home": r.get("home"), "away": r.get("away")}
@@ -275,13 +946,15 @@ def export_picks(rows_all: List[Dict], date_str: str):
             vi = value_index(ev, k)
             if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
                 picks.append({**base, "market":"OU-Over", "book":_fmt_ou_book(r.get("ou_main_line"), r.get("odds_ou_main_over"), False),
-                              "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)})
+                              "ev":float(ev),"kelly":float(k),"value_index":float(vi),
+                              "stake_pct":_stake_pct_from_kelly(k, _pick_quality(r, "ou"))})
         ev, k = r.get("ev_ou_main_under"), r.get("kelly_ou_main_under")
         if ev is not None and k is not None:
             vi = value_index(ev, k)
             if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
                 picks.append({**base, "market":"OU-Under", "book":_fmt_ou_book(r.get("ou_main_line"), r.get("odds_ou_main_under"), False),
-                              "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)})
+                              "ev":float(ev),"kelly":float(k),"value_index":float(vi),
+                              "stake_pct":_stake_pct_from_kelly(k, _pick_quality(r, "ou"))})
         # 1X2
         for mk, evk, kel, odd in [
             ("1X2-Home", r.get("ev_1x2_home"), r.get("kelly_1x2_home"), r.get("odds_1x2_home")),
@@ -292,7 +965,8 @@ def export_picks(rows_all: List[Dict], date_str: str):
                 vi = value_index(evk, kel)
                 if evk>=PICKS_MIN_EV and kel>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
                     picks.append({**base, "market":mk, "book":f"{mk}@{float(odd):.2f}",
-                                  "ev":float(evk),"kelly":float(kel),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(kel)})
+                                  "ev":float(evk),"kelly":float(kel),"value_index":float(vi),
+                                  "stake_pct":_stake_pct_from_kelly(kel, _pick_quality(r, mk))})
         # AH 主盘
         ah_line = r.get("ah_line")
         if ah_line is not None:
@@ -303,22 +977,26 @@ def export_picks(rows_all: List[Dict], date_str: str):
                 if evk is not None and kel is not None and odd is not None:
                     vi = value_index(evk, kel)
                     if evk>=PICKS_MIN_EV and kel>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                        picks.append({**base, "market":f"AH-{'Home' if side=='home' else 'Away'}",
+                        market_tag = f"AH-{'Home' if side=='home' else 'Away'}"
+                        picks.append({**base, "market":market_tag,
                                       "book":_fmt_ah_book(ah_line, odd, side),
-                                      "ev":float(evk),"kelly":float(kel),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(kel)})
+                                      "ev":float(evk),"kelly":float(kel),"value_index":float(vi),
+                                      "stake_pct":_stake_pct_from_kelly(kel, _pick_quality(r, market_tag))})
         # 角球 OU 主盘
         ev, k = r.get("ev_crn_main_over"), r.get("kelly_crn_main_over")
         if ev is not None and k is not None:
             vi = value_index(ev, k)
             if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
                 picks.append({**base,"market":"CRN-Over","book":_fmt_ou_book(r.get("crn_main_line"), r.get("odds_crn_main_over"), True),
-                              "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)})
+                              "ev":float(ev),"kelly":float(k),"value_index":float(vi),
+                              "stake_pct":_stake_pct_from_kelly(k, _pick_quality(r, "crn"))})
         ev, k = r.get("ev_crn_main_under"), r.get("kelly_crn_main_under")
         if ev is not None and k is not None:
             vi = value_index(ev, k)
             if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
                 picks.append({**base,"market":"CRN-Under","book":_fmt_ou_book(r.get("crn_main_line"), r.get("odds_crn_main_under"), True),
-                              "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)})
+                              "ev":float(ev),"kelly":float(k),"value_index":float(vi),
+                              "stake_pct":_stake_pct_from_kelly(k, _pick_quality(r, "crn"))})
 
     picks.sort(key=lambda x: x.get("value_index", -999), reverse=True)
     if PICKS_TOP_N is not None:
@@ -505,62 +1183,114 @@ def main():
         h_st = TEAM_STATS_CACHE.get((league_id, season, home_id), {}) or {}
         a_st = TEAM_STATS_CACHE.get((league_id, season, away_id), {}) or {}
 
-        def _safe(path, d, default):
-            cur = d
-            for k in path:
-                cur = (cur or {}).get(k)
-                if cur is None: return default
-            try: return float(cur) if cur else default
-            except: return default
-
-        h_gf_home = _safe(["goals","for","average","home"], h_st, 1.3)
-        h_ga_home = _safe(["goals","against","average","home"], h_st, 1.3)
-        a_gf_away = _safe(["goals","for","average","away"], a_st, 1.3)
-        a_ga_away = _safe(["goals","against","average","away"], a_st, 1.3)
-
-        denom = max(league_avg, 1e-6)
-        h_att = h_gf_home / denom; h_def = h_ga_home / denom
-        a_att = a_gf_away / denom; a_def = a_ga_away / denom
-
-        lam_home, lam_away = expected_goals_from_strengths(h_att, a_def, a_att, h_def, league_avg, HOME_ADV)
-
-        sim = monte_carlo_simulate(lam_home, lam_away, n_sims=N_SIMS_GOALS, over_line=2.5)
-        _, _, totals = simulate_goals(lam_home, lam_away, n_sims=N_SIMS_GOALS)
-        try: totals = [int(x) for x in totals]
-        except: totals = [int(totals)]
+        lambda_models = compute_lambda_models(
+            league_id=league_id,
+            season=season,
+            home_id=home_id,
+            away_id=away_id,
+            h_stats=h_st,
+            a_stats=a_st,
+            league_avg=league_avg,
+        )
+        lam_home_raw, lam_away_raw, lam_weights = blend_lambda_models(lambda_models, LAMBDA_MODEL_CONFIG)
+        coverage = lambda_coverage_score(lambda_models, lam_weights, LAMBDA_MODEL_CONFIG)
+        lam_detail = format_lambda_detail(lambda_models, lam_weights)
 
         odds = odds_by_fixture(fx_id) if fx_id else {}
 
+        lam_home, lam_away, lam_market_total, lam_notes = adjust_lambdas_with_guards(
+            lam_home_raw, lam_away_raw, odds, coverage, notes=[]
+        )
+        lam_guard_note = ";".join(lam_notes)
+        if lam_guard_note:
+            lam_detail = f"{lam_detail} | guards:{lam_guard_note}"
+        if LOG_LAMBDA_BLEND:
+            log_lambda_blend(home_name, away_name, lambda_models, lam_weights, lam_home, lam_away)
+            extra = [f"coverage={coverage:.2f}"]
+            if lam_market_total is not None:
+                extra.append(f"market_tot≈{lam_market_total:.2f}")
+            if lam_guard_note:
+                extra.append(f"guards={lam_guard_note}")
+            print("    ↳ " + " | ".join(extra))
+
+        sim = monte_carlo_simulate(lam_home, lam_away, n_sims=N_SIMS_GOALS, over_line=2.5)
+        _, _, totals = simulate_goals(lam_home, lam_away, n_sims=N_SIMS_GOALS)
+        try:
+            totals = [int(x) for x in totals]
+        except Exception:
+            totals = [int(totals)]
+
         # ===== 1X2 =====
-        o1_h,o1_d,o1_a = odds.get("1x2_home"),odds.get("1x2_draw"),odds.get("1x2_away")
-        ev1_h=ev1_d=ev1_a=k1_h=k1_d=k1_a=None
-        ok1 = sanitize_1x2(o1_h,o1_d,o1_a)
+        o1_h, o1_d, o1_a = odds.get("1x2_home"), odds.get("1x2_draw"), odds.get("1x2_away")
+        ev1_h = ev1_d = ev1_a = k1_h = k1_d = k1_a = None
+        model_probs_1x2 = {
+            "p_home": float(sim.get("p_home", 0.0)),
+            "p_draw": float(sim.get("p_draw", 0.0)),
+            "p_away": float(sim.get("p_away", 0.0)),
+        }
+        market_probs_1x2: Optional[Dict[str, float]] = None
+        ok1 = sanitize_1x2(o1_h, o1_d, o1_a)
         if ok1:
-            o1_h,o1_d,o1_a = ok1
-            ev1_h,k1_h = ev_kelly_binary(sim["p_home"], o1_h)
-            ev1_d,k1_d = ev_kelly_binary(sim["p_draw"], o1_d)
-            ev1_a,k1_a = ev_kelly_binary(sim["p_away"], o1_a)
-            if is_ev_outlier(max([x for x in (ev1_h,ev1_d,ev1_a) if x is not None], default=0)):
-                ev1_h=ev1_d=ev1_a=k1_h=k1_d=k1_a=None
+            o1_h, o1_d, o1_a = ok1
+            inv_h = 1.0 / o1_h
+            inv_d = 1.0 / o1_d
+            inv_a = 1.0 / o1_a
+            denom = inv_h + inv_d + inv_a
+            if denom > 0:
+                market_probs_1x2 = {
+                    "p_home": inv_h / denom,
+                    "p_draw": inv_d / denom,
+                    "p_away": inv_a / denom,
+                }
+        else:
+            o1_h = o1_d = o1_a = None
+
+        blend_alpha = max(0.35, min(0.90, 0.55 + 0.30 * coverage))
+        draw_boost = 0.05 + 0.05 * (1.0 - coverage)
+        prob_1x2 = dict(model_probs_1x2)
+        if market_probs_1x2:
+            prob_1x2 = blend_probabilities_with_market(model_probs_1x2, market_probs_1x2, blend_alpha)
+        prob_1x2 = apply_draw_inflation(prob_1x2, draw_boost)
+        sim.update(prob_1x2)
+
+        if ok1:
+            ev1_h, k1_h = ev_kelly_binary(prob_1x2["p_home"], o1_h)
+            ev1_d, k1_d = ev_kelly_binary(prob_1x2["p_draw"], o1_d)
+            ev1_a, k1_a = ev_kelly_binary(prob_1x2["p_away"], o1_a)
+            if is_ev_outlier(max([x for x in (ev1_h, ev1_d, ev1_a) if x is not None], default=0)):
+                ev1_h = ev1_d = ev1_a = k1_h = k1_d = k1_a = None
 
         # ===== Goals OU 主盘 =====
-        ou_main_line   = odds.get("ou_main_line")
-        ou_main_over   = odds.get("ou_main_over")
-        ou_main_under  = odds.get("ou_main_under")
-        ou_cnt_o       = odds.get("ou_main_over_cnt") or 0
-        ou_cnt_u       = odds.get("ou_main_under_cnt") or 0
-        ou_overround   = odds.get("ou_main_overround") or 9.9
+        ou_main_line = odds.get("ou_main_line")
+        ou_main_over = odds.get("ou_main_over")
+        ou_main_under = odds.get("ou_main_under")
+        ou_cnt_o = int(odds.get("ou_main_over_cnt") or 0)
+        ou_cnt_u = int(odds.get("ou_main_under_cnt") or 0)
+        try:
+            ou_overround_val = float(odds.get("ou_main_overround"))
+        except (TypeError, ValueError):
+            ou_overround_val = None
+        ou_overround = ou_overround_val if ou_overround_val is not None else 9.9
 
+        ou_main_reason = "no_line" if ou_main_line is None else "no_odds"
         ev_main_over = ev_main_under = k_main_over = k_main_under = None
-        if ou_main_line is not None and ou_main_over is not None and ou_main_under is not None:
-            pair = sanitize_ou_pair(ou_main_over, ou_main_under)
-            if pair and (not STRICT_OU_MAIN or (ou_cnt_o >= OU_MIN_CNT and ou_cnt_u >= OU_MIN_CNT and ou_overround <= OU_MAX_OR)):
-                ou_main_over, ou_main_under = pair
+        pair = sanitize_ou_pair(ou_main_over, ou_main_under)
+        if pair and ou_main_line is not None:
+            ou_main_over, ou_main_under = pair
+            allowed, reason, _ = _assess_ou_main(ou_cnt_o, ou_cnt_u, ou_overround_val, STRICT_OU_MAIN)
+            if allowed:
                 res = ou_ev_kelly_from_totals_quarter(float(ou_main_line), float(ou_main_over), float(ou_main_under), totals)
-                ev_main_over, k_main_over = res["EV_over"],  res["Kelly_over"]
+                ev_main_over, k_main_over = res["EV_over"], res["Kelly_over"]
                 ev_main_under, k_main_under = res["EV_under"], res["Kelly_under"]
                 if is_ev_outlier(max([x for x in (ev_main_over, ev_main_under) if x is not None], default=0)):
                     ev_main_over = ev_main_under = k_main_over = k_main_under = None
+                    ou_main_reason = "ev_outlier"
+                else:
+                    ou_main_reason = "ok"
+            else:
+                ou_main_reason = reason
+        elif ou_main_line is not None and not pair:
+            ou_main_reason = "pair_invalid"
 
         # ===== OU@2.5 参考 =====
         o25_over,o25_under = odds.get("ou_over_2_5"),odds.get("ou_under_2_5")
@@ -578,11 +1308,20 @@ def main():
         ah_lines = build_ah_lines(odds)
 
         # ===== AH 主盘（缺就从全线里自选）
-        ah_line, ah_oh, ah_oa = odds.get("ah_line"), odds.get("ah_home_odds"), odds.get("ah_away_odds")
+        ah_line = odds.get("ah_line")
+        ah_oh = odds.get("ah_home_odds")
+        ah_oa = odds.get("ah_away_odds")
+        ah_main_reason = "no_market"
+        ah_source = None
         if ah_line is None or ah_oh is None or ah_oa is None:
             pick = select_best_ah_main(ah_lines, strict=STRICT_AH_MAIN)
             if pick:
                 ah_line, ah_oh, ah_oa = pick
+                ah_source = "matrix"
+            else:
+                ah_main_reason = "no_main_candidate" if ah_lines else "no_lines"
+        else:
+            ah_source = "api"
 
         ev_ah_h = ev_ah_a = k_ah_h = k_ah_a = None
         if ah_line is not None and ah_oh is not None and ah_oa is not None:
@@ -595,9 +1334,11 @@ def main():
                 ev_ah_a, k_ah_a = evk["away"].get("EV"), evk["away"].get("Kelly")
             if is_ev_outlier(max([x for x in (ev_ah_h, ev_ah_a) if x is not None], default=0)):
                 ev_ah_h = ev_ah_a = k_ah_h = k_ah_a = None
+                ah_main_reason = "ev_outlier"
             else:
                 if ev_ah_h is not None: cnt_ah_ev_home += 1
                 if ev_ah_a is not None: cnt_ah_ev_away += 1
+                ah_main_reason = f"ok_{ah_source or 'api'}"
 
         # ===== 角球 OU 主盘 =====
         crn_main_line  = odds.get("crn_main_line")
@@ -635,15 +1376,25 @@ def main():
                 ov = [x for x in sides.get("over", []) if x]; un = [x for x in sides.get("under", []) if x]
                 if not ov or not un: continue
                 om, um = _median(ov), _median(un); oround = _ou_overround(om, um)
-                ou_lines[str(float(line))] = {"over_median": om, "under_median": um,
-                                              "over_cnt": len(ov), "under_cnt": len(un), "overround": oround}
+                ou_lines[str(float(line))] = {
+                    "over_median": om, "under_median": um,
+                    "over_cnt": len(ov), "under_cnt": len(un), "overround": oround,
+                    "direction_ok": True, "swapped": False
+                }
         if not crn_lines and odds.get("_raw_crn_map"):
             for line, sides in odds["_raw_crn_map"].items():
                 ov = [x for x in sides.get("over", []) if x]; un = [x for x in sides.get("under", []) if x]
                 if not ov or not un: continue
-                om, um = _median(ov), _median(un); oround = _ou_overround(om, um)
-                crn_lines[str(float(line))] = {"over_median": om, "under_median": um,
-                                               "over_cnt": len(ov), "under_cnt": len(un), "overround": oround}
+                om, um = _median(ov), _median(un)
+                adj_over, adj_under, direction_ok = _adjust_corner_line_for_sanity(line, om, um)
+                if adj_over is None or adj_under is None or not direction_ok:
+                    continue
+                oround = _ou_overround(adj_over, adj_under)
+                crn_lines[str(float(line))] = {
+                    "over_median": adj_over, "under_median": adj_under,
+                    "over_cnt": len(ov), "under_cnt": len(un), "overround": oround,
+                    "direction_ok": bool(direction_ok), "swapped": adj_over != om or adj_under != um
+                }
 
         # —— 全线榜单池（OU）
         for sline, info in (ou_lines.items() if isinstance(ou_lines, dict) else []):
@@ -651,7 +1402,24 @@ def main():
             except: continue
             om, um = info.get("over_median"), info.get("under_median")
             oround = info.get("overround", 9.9)
-            if om is None or um is None or not (1.00 <= float(oround) <= 1.25): continue
+            over_cnt = int(info.get("over_cnt", 0) or 0)
+            under_cnt = int(info.get("under_cnt", 0) or 0)
+            if om is None or um is None:
+                continue
+            if over_cnt < 2 or under_cnt < 2:
+                continue
+            if ou_main_line is not None:
+                try:
+                    if abs(line - float(ou_main_line)) > ALLLINE_MAX_GAP:
+                        continue
+                except Exception:
+                    pass
+            try:
+                or_val = float(oround)
+            except Exception:
+                or_val = 9.9
+            if not (1.00 <= or_val <= 1.20):
+                continue
             resL = ou_ev_kelly_from_totals_quarter(line, float(om), float(um), totals)
             if resL["EV_over"] is not None and resL["Kelly_over"] is not None:
                 vi = value_index(resL["EV_over"], resL["Kelly_over"])
@@ -670,7 +1438,26 @@ def main():
             except: continue
             om, um = info.get("over_median"), info.get("under_median")
             oround = info.get("overround", 9.9)
-            if om is None or um is None or not (1.00 <= float(oround) <= 1.30): continue
+            over_cnt = int(info.get("over_cnt", 0) or 0)
+            under_cnt = int(info.get("under_cnt", 0) or 0)
+            if om is None or um is None:
+                continue
+            if info.get("direction_ok") is False:
+                continue
+            if over_cnt < 2 or under_cnt < 2:
+                continue
+            if crn_main_line is not None:
+                try:
+                    if abs(line - float(crn_main_line)) > ALLLINE_MAX_GAP:
+                        continue
+                except Exception:
+                    pass
+            try:
+                or_val = float(oround)
+            except Exception:
+                or_val = 9.9
+            if not (1.00 <= or_val <= 1.25):
+                continue
             resCL = ou_ev_kelly_from_totals_quarter(line, float(om), float(um), crn_totals_list)
             if resCL["EV_over"] is not None and resCL["Kelly_over"] is not None:
                 vi = value_index(resCL["EV_over"], resCL["Kelly_over"])
@@ -755,10 +1542,19 @@ def main():
         best_kelly = cands[0][3] if cands else None
 
         # ===== 写行 =====
-        rows_all.append({
+        weight_fields = {
+            f"lam_weight_{name}": round(lam_weights.get(name, 0.0), 3)
+            for name, data in lambda_models.items()
+            if data.get("lam_home") is not None and data.get("lam_away") is not None
+        }
+
+        row = {
             "date_utc": date_str, "kickoff_utc": kickoff_utc, "league": league_name,
             "home": home_name, "away": away_name,
-            "lam_home": round(sim["lam_home"],3), "lam_away": round(sim["lam_away"],3),
+            "lam_home": round(lam_home,3), "lam_away": round(lam_away,3),
+            "lam_market_total": round(lam_market_total,3) if lam_market_total is not None else None,
+            "lam_coverage": round(coverage,3),
+            "lam_guard_notes": lam_guard_note or None,
             "p_home": round(sim["p_home"],4), "p_draw": round(sim["p_draw"],4), "p_away": round(sim["p_away"],4),
             "p_over2.5": round(sim["p_over"],4), "p_under2.5": round(sim["p_under"],4),
 
@@ -768,6 +1564,7 @@ def main():
             "ou_main_over_cnt": ou_cnt_o, "ou_main_under_cnt": ou_cnt_u, "ou_main_overround": ou_overround,
             "ev_ou_main_over": ev_main_over, "kelly_ou_main_over": k_main_over,
             "ev_ou_main_under": ev_main_under, "kelly_ou_main_under": k_main_under,
+            "ou_main_reason": ou_main_reason,
 
             # OU@2.5 参考
             "odds_ou_over2.5": odds.get("ou_over_2_5"), "odds_ou_under2.5": odds.get("ou_under_2_5"),
@@ -783,6 +1580,7 @@ def main():
             "ah_line": ah_line, "odds_ah_home": ah_oh, "odds_ah_away": ah_oa,
             "ev_ah_home": ev_ah_h, "kelly_ah_home": k_ah_h,
             "ev_ah_away": ev_ah_a, "kelly_ah_away": k_ah_a,
+            "ah_main_reason": ah_main_reason,
 
             # Corners OU 主盘（含诊断 + EV）
             "crn_main_line": crn_main_line,
@@ -793,7 +1591,14 @@ def main():
 
             "best_market": best_label, "best_ev": best_ev, "best_kelly": best_kelly,
             "value_index": value_index(best_ev, best_kelly) if (best_ev is not None and best_kelly is not None) else None
-        })
+        }
+
+        if lam_detail:
+            row["lam_blend_detail"] = lam_detail
+        for k, v in weight_fields.items():
+            row[k] = v
+
+        rows_all.append(row)
 
         done += 1
         if done % 30 == 0 or done == len(fixtures):
@@ -804,13 +1609,15 @@ def main():
     out_file = os.path.join(out_dir, f"daily_brief_{date_str}.csv")
     base_order = [
         "date_utc","kickoff_utc","league","home","away",
-        "lam_home","lam_away","p_home","p_draw","p_away","p_over2.5","p_under2.5",
+        "lam_home","lam_away","lam_market_total","lam_coverage","lam_guard_notes",
+        "lam_weight_season","lam_weight_recent","lam_blend_detail",
+        "p_home","p_draw","p_away","p_over2.5","p_under2.5",
         "ou_main_line","odds_ou_main_over","odds_ou_main_under",
-        "ou_main_over_cnt","ou_main_under_cnt","ou_main_overround",
+        "ou_main_over_cnt","ou_main_under_cnt","ou_main_overround","ou_main_reason",
         "ev_ou_main_over","kelly_ou_main_over","ev_ou_main_under","kelly_ou_main_under",
         "odds_ou_over2.5","odds_ou_under2.5","ev_ou_over2.5","kelly_ou_over2.5","ev_ou_under2.5","kelly_ou_under2.5",
         "odds_1x2_home","odds_1x2_draw","odds_1x2_away","ev_1x2_home","kelly_1x2_home","ev_1x2_draw","kelly_1x2_draw","ev_1x2_away","kelly_1x2_away",
-        "ah_line","odds_ah_home","odds_ah_away","ev_ah_home","kelly_ah_home","ev_ah_away","kelly_ah_away",
+        "ah_line","odds_ah_home","odds_ah_away","ev_ah_home","kelly_ah_home","ev_ah_away","kelly_ah_away","ah_main_reason",
         "crn_main_line","odds_crn_main_over","odds_crn_main_under","crn_main_over_cnt","crn_main_under_cnt","crn_main_overround",
         "ev_crn_main_over","kelly_crn_main_over","ev_crn_main_under","kelly_crn_main_under",
         "best_market","best_ev","best_kelly","value_index"

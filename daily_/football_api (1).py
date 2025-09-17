@@ -43,6 +43,9 @@ _SESSION_LOCK = threading.Lock()
 
 _MEMO: Dict[str, tuple[float, dict]] = {}
 
+CRN_LOW_LINE_THRESHOLD = 4.5
+CRN_LOW_LINE_OVER_MIN = 0.55
+
 def _memo_key(endpoint: str, params: dict) -> str:
     s = json.dumps({"e": endpoint, "p": params}, sort_keys=True, separators=(",", ":"))
     return hashlib.md5(s.encode("utf-8")).hexdigest()
@@ -144,9 +147,21 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
         return False
 
     def is_asian_handicap(name: str) -> bool:
-        n = (name or "").lower()
-        if "asian handicap" in n or ("handicap" in n and "european" not in n):
-            return "corner" not in n and "cards" not in n and "booking" not in n
+        n = (name or "").lower().strip()
+        if not n:
+            return False
+        if any(term in n for term in ("corner", "corners", "cards", "booking")):
+            return False
+        if "goal line" in n or "total" in n or "over/under" in n or "over under" in n:
+            return False
+        if "asian handicap" in n or n in {"handicap", "asian lines", "ah", "spread"}:
+            return True
+        if "handicap" in n and "goal" not in n and "total" not in n:
+            return True
+        if "spread" in n and "goal" not in n:
+            return True
+        if "line" in n and "handicap" in n:
+            return True
         return False
 
     def _parse_float(x):
@@ -162,6 +177,29 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                 lst.append(v)
         except Exception:
             pass
+
+    def _adjust_corner_line(line, over, under):
+        try:
+            line_f = float(line)
+            over_f = float(over)
+            under_f = float(under)
+        except (TypeError, ValueError):
+            return over, under, True, False
+        swapped = False
+        direction_ok = True
+        if line_f <= CRN_LOW_LINE_THRESHOLD and over_f > 1.0 and under_f > 1.0:
+            inv_over = 1.0 / over_f
+            inv_under = 1.0 / under_f
+            total = inv_over + inv_under
+            if total > 0:
+                prob_over = inv_over / total
+                prob_under = inv_under / total
+                if prob_over < CRN_LOW_LINE_OVER_MIN and prob_under > CRN_LOW_LINE_OVER_MIN:
+                    swapped = True
+                    over_f, under_f = under_f, over_f
+                    prob_over, prob_under = prob_under, prob_over
+                direction_ok = prob_over >= CRN_LOW_LINE_OVER_MIN
+        return over_f, under_f, direction_ok, swapped
 
     h_list, d_list, a_list = [], [], []
     ou_map: Dict[float, Dict[str, List[float]]] = {}
@@ -221,16 +259,35 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                 # 亚洲让球（非角球）
                 if is_asian_handicap(name):
                     for v in values:
-                        side_txt = (v.get("value") or "").lower().strip()   # "Home"/"Away"
+                        side_raw = (v.get("value") or "").strip()
+                        side_txt = side_raw.lower()
                         odd = _parse_float(v.get("odd"))
-                        line = _parse_float(v.get("handicap"))
-                        if side_txt not in ("home","away") or line is None or odd is None:
+                        line_val = v.get("handicap") or v.get("line") or v.get("spread")
+                        line = _parse_float(line_val)
+                        side = None
+                        if side_txt in ("home", "1", "team1", "home team"):
+                            side = "home"
+                        elif side_txt in ("away", "2", "team2", "away team"):
+                            side = "away"
+                        elif "home" in side_txt or side_txt.startswith("1"):
+                            side = "home"
+                        elif "away" in side_txt or side_txt.startswith("2"):
+                            side = "away"
+                        if odd is None or side is None:
                             continue
-                        home_line = float(line) if side_txt == "home" else -float(line)
-                        if 1.10 <= odd <= 50.0:
-                            ah_map.setdefault(home_line, {"home": [], "away": []})
-                            if side_txt == "home": ah_map[home_line]["home"].append(odd)
-                            else:                  ah_map[home_line]["away"].append(odd)
+                        if line is None and side_raw:
+                            cleaned = ''.join(ch for ch in side_raw if ch in "+-.0123456789")
+                            line = _parse_float(cleaned)
+                        if line is None:
+                            continue
+                        if not (1.10 <= odd <= 50.0):
+                            continue
+                        home_line = float(line) if side == "home" else -float(line)
+                        ah_map.setdefault(home_line, {"home": [], "away": []})
+                        if side == "home":
+                            ah_map[home_line]["home"].append(odd)
+                        else:
+                            ah_map[home_line]["away"].append(odd)
 
     out: Dict[str, float] = {}
 
@@ -333,10 +390,17 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
             om, um = _median(ov), _median(un)
             if not om or not um:
                 continue
-            oround = 1.0/om + 1.0/um
+            adj_over, adj_under, direction_ok, swapped = _adjust_corner_line(line, om, um)
+            if not adj_over or not adj_under or not direction_ok:
+                continue
+            oround = 1.0/adj_over + 1.0/adj_under
             if 1.00 <= oround <= 1.30:
-                crn_all_list.append({"line": float(line), "over": float(om), "under": float(um),
-                                     "co": int(len(ov)), "cu": int(len(un)), "overround": float(oround)})
+                crn_all_list.append({
+                    "line": float(line),
+                    "over": float(adj_over), "under": float(adj_under),
+                    "co": int(len(ov)), "cu": int(len(un)), "overround": float(oround),
+                    "direction_ok": bool(direction_ok), "swapped": bool(swapped)
+                })
     if crn_all_list:
         out["crn_all"] = sorted(crn_all_list, key=lambda x: x["line"])
 
@@ -370,7 +434,7 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
     out["_raw_ah_map"]  = _clean_ah_map(ah_map)
 
     # —— 已清洗“全线矩阵”摘要（中位数、样本、超额） —— #
-    def pack_ou_lines(src: Dict[float, Dict[str, List[float]]]) -> Dict[str, Dict[str, float]]:
+    def pack_ou_lines(src: Dict[float, Dict[str, List[float]]], market: str = "OU") -> Dict[str, Dict[str, float]]:
         res: Dict[str, Dict[str, float]] = {}
         for line, sides in src.items():
             ov = [x for x in sides.get("over", []) if x]
@@ -380,6 +444,12 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
             om, um = _median(ov), _median(un)
             if not om or not um:
                 continue
+            swapped = False
+            direction_ok = True
+            if market == "CRN":
+                om, um, direction_ok, swapped = _adjust_corner_line(line, om, um)
+                if not om or not um or not direction_ok:
+                    continue
             overround = 1.0/om + 1.0/um
             res[str(float(line))] = {
                 "over_median": float(om),
@@ -387,6 +457,8 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                 "over_cnt": int(len(ov)),
                 "under_cnt": int(len(un)),
                 "overround": float(overround),
+                "direction_ok": bool(direction_ok),
+                "swapped": bool(swapped),
             }
         return res
 
@@ -410,8 +482,8 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
             }
         return res
 
-    out["ou_lines"]  = pack_ou_lines(out["_raw_ou_map"])
-    out["crn_lines"] = pack_ou_lines(out["_raw_crn_map"])
+    out["ou_lines"]  = pack_ou_lines(out["_raw_ou_map"], market="OU")
+    out["crn_lines"] = pack_ou_lines(out["_raw_crn_map"], market="CRN")
     out["ah_lines"]  = pack_ah_lines(out["_raw_ah_map"])
 
     return out
