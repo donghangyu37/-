@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional, Set
 import math, os, csv, traceback, random
+from dataclasses import dataclass
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
@@ -44,6 +45,50 @@ MIN_EV = 0.00
 # 角球 λ 兜底
 CORNER_BASE = 7.5
 CORNER_PER_GOAL = 0.9
+
+# ===== 联赛层级与EV阈值配置 =====
+TOP_TIER_LEAGUE_IDS = {
+    2,   # Champions League
+    3,   # Europa League
+    5,   # Europa Conference League
+    39,  # Premier League
+    61,  # Ligue 1
+    78,  # Bundesliga
+    135, # Serie A
+    140, # La Liga
+}
+
+TOP_TIER_KEYWORDS = {
+    "premier league",
+    "la liga",
+    "bundesliga",
+    "serie a",
+    "ligue 1",
+    "champions league",
+    "europa league",
+    "conference league",
+}
+
+
+@dataclass(frozen=True)
+class EVThreshold:
+    keep_min: float
+    preferred_max: float
+    review_max: float
+    drop_max: float
+
+
+EV_THRESHOLDS: Dict[Tuple[str, str], EVThreshold] = {
+    ("top", "1x2"): EVThreshold(0.02, 0.06, 0.12, 0.12),
+    ("top", "ou"):  EVThreshold(0.02, 0.06, 0.12, 0.12),
+    ("top", "ah"):  EVThreshold(0.02, 0.06, 0.12, 0.12),
+    ("top", "derivative"): EVThreshold(0.05, 0.12, 0.18, 0.25),
+
+    ("other", "1x2"): EVThreshold(0.04, 0.10, 0.15, 0.18),
+    ("other", "ou"):  EVThreshold(0.04, 0.10, 0.15, 0.18),
+    ("other", "ah"):  EVThreshold(0.04, 0.10, 0.15, 0.18),
+    ("other", "derivative"): EVThreshold(0.05, 0.12, 0.18, 0.25),
+}
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -127,6 +172,108 @@ def ev_kelly_binary(p: float, odds: float) -> Tuple[float, float]:
 def value_index(ev: float | None, kelly: float | None) -> float:
     if ev is None or kelly is None: return -999.0
     return float(ev * math.sqrt(max(0.0, kelly)))
+
+
+def classify_league_tier(league_info: Dict) -> str:
+    try:
+        lid = int((league_info or {}).get("id"))
+    except Exception:
+        lid = None
+    if lid in TOP_TIER_LEAGUE_IDS:
+        return "top"
+
+    name = str((league_info or {}).get("name", "")).lower()
+    if any(key in name for key in TOP_TIER_KEYWORDS):
+        return "top"
+
+    return "other"
+
+
+def get_ev_threshold(league_tier: str, market_group: str) -> EVThreshold:
+    return EV_THRESHOLDS.get((league_tier, market_group)) or EV_THRESHOLDS.get(("other", market_group)) or EV_THRESHOLDS[("other", "derivative")]
+
+
+def kelly_cap_for_league(league_tier: str) -> float:
+    return 0.08 if league_tier == "top" else 0.05
+
+
+def _to_float_or_none(value) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def assess_consensus(info: Dict[str, object] | None, league_tier: str) -> Tuple[bool, bool, str]:
+    info = info or {}
+    min_bm = 6 if league_tier == "top" else 8
+
+    bm_raw = info.get("bookmakers")
+    bm = _to_float_or_none(bm_raw)
+    bm_int = int(bm) if bm is not None else 0
+
+    oround = _to_float_or_none(info.get("overround"))
+    update = _to_float_or_none(info.get("update"))
+
+    ok = True
+    reasons: List[str] = []
+    if bm_int < min_bm:
+        ok = False
+        reasons.append(f"bookmakers<{min_bm}")
+    if oround is None or not (1.02 <= oround <= 1.12):
+        ok = False
+        reasons.append("overround")
+    if update is None or update > 10:
+        ok = False
+        reasons.append("stale")
+
+    strong = bm_int >= 8 and update is not None and update <= 5 and ok
+    return ok, strong, ",".join(reasons)
+
+
+def evaluate_market_value(
+    ev: Optional[float],
+    kelly: Optional[float],
+    market_group: str,
+    league_tier: str,
+    consensus_info: Dict[str, object] | None,
+) -> Tuple[Optional[float], Optional[float], str, str, Optional[float]]:
+    if ev is None or kelly is None:
+        return None, None, "drop", "missing", None
+
+    ev_val = _to_float_or_none(ev)
+    k_val = _to_float_or_none(kelly)
+    if ev_val is None or k_val is None or ev_val <= 0 or k_val <= 0:
+        return None, None, "drop", "nonpositive", None
+
+    cap = kelly_cap_for_league(league_tier)
+    k_adj = min(cap, max(0.0, k_val))
+    if k_adj <= 0:
+        return None, None, "drop", "kelly_zero", None
+
+    vi = value_index(ev_val, k_adj)
+    consensus_ok, strong, reason = assess_consensus(consensus_info, league_tier)
+    if not consensus_ok:
+        return None, None, "drop", f"consensus:{reason}", None
+
+    thr = get_ev_threshold(league_tier, market_group)
+    ev_abs = abs(ev_val)
+
+    if ev_abs < thr.keep_min:
+        return None, None, "low", "below_min", None
+    if ev_abs <= thr.preferred_max:
+        quality = "keep"
+    elif ev_abs <= thr.review_max:
+        quality = "review"
+    elif ev_abs <= thr.drop_max:
+        quality = "review_high"
+    else:
+        return None, None, "drop", "above_max", None
+
+    if ev_abs > 0.15 and not (strong and vi is not None and vi > 0):
+        return None, None, "drop", "high_ev_weak_consensus", None
+
+    return float(ev_val), float(k_adj), quality, "", float(vi)
 
 # ===== 四分之一盘精结算（基于 totals 样本）=====
 def ou_ev_kelly_from_totals_quarter(line: float, over_odds: float, under_odds: float, totals) -> dict:
@@ -624,14 +771,16 @@ def export_picks(rows_all: List[Dict], date_str: str):
                 "league": r.get("league"), "home": r.get("home"), "away": r.get("away")}
         # Goals OU 主盘
         ev, k = r.get("ev_ou_main_over"), r.get("kelly_ou_main_over")
-        if ev is not None and k is not None:
-            vi = value_index(ev, k)
+        if ev is not None and k is not None and r.get("quality_ou_main_over") == "keep":
+            vi = r.get("vi_ou_main_over")
+            vi = vi if vi is not None else value_index(ev, k)
             if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
                 picks.append({**base, "market":"OU-Over", "book":_fmt_ou_book(r.get("ou_main_line"), r.get("odds_ou_main_over"), False),
                               "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)})
         ev, k = r.get("ev_ou_main_under"), r.get("kelly_ou_main_under")
-        if ev is not None and k is not None:
-            vi = value_index(ev, k)
+        if ev is not None and k is not None and r.get("quality_ou_main_under") == "keep":
+            vi = r.get("vi_ou_main_under")
+            vi = vi if vi is not None else value_index(ev, k)
             if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
                 picks.append({**base, "market":"OU-Under", "book":_fmt_ou_book(r.get("ou_main_line"), r.get("odds_ou_main_under"), False),
                               "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)})
@@ -641,8 +790,19 @@ def export_picks(rows_all: List[Dict], date_str: str):
             ("1X2-Draw", r.get("ev_1x2_draw"), r.get("kelly_1x2_draw"), r.get("odds_1x2_draw")),
             ("1X2-Away", r.get("ev_1x2_away"), r.get("kelly_1x2_away"), r.get("odds_1x2_away")),
         ]:
-            if evk is not None and kel is not None and odd is not None:
-                vi = value_index(evk, kel)
+            qual_key = {
+                "1X2-Home": "quality_1x2_home",
+                "1X2-Draw": "quality_1x2_draw",
+                "1X2-Away": "quality_1x2_away",
+            }[mk]
+            vi_key = {
+                "1X2-Home": "vi_1x2_home",
+                "1X2-Draw": "vi_1x2_draw",
+                "1X2-Away": "vi_1x2_away",
+            }[mk]
+            if evk is not None and kel is not None and odd is not None and r.get(qual_key) == "keep":
+                vi = r.get(vi_key)
+                vi = vi if vi is not None else value_index(evk, kel)
                 if evk>=PICKS_MIN_EV and kel>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
                     picks.append({**base, "market":mk, "book":f"{mk}@{float(odd):.2f}",
                                   "ev":float(evk),"kelly":float(kel),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(kel)})
@@ -653,22 +813,26 @@ def export_picks(rows_all: List[Dict], date_str: str):
                 ("home", r.get("ev_ah_home"), r.get("kelly_ah_home"), r.get("odds_ah_home")),
                 ("away", r.get("ev_ah_away"), r.get("kelly_ah_away"), r.get("odds_ah_away")),
             ]:
-                if evk is not None and kel is not None and odd is not None:
-                    vi = value_index(evk, kel)
+                qual = r.get("quality_ah_home" if side == "home" else "quality_ah_away")
+                vi_val = r.get("vi_ah_home" if side == "home" else "vi_ah_away")
+                if evk is not None and kel is not None and odd is not None and qual == "keep":
+                    vi = vi_val if vi_val is not None else value_index(evk, kel)
                     if evk>=PICKS_MIN_EV and kel>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
                         picks.append({**base, "market":f"AH-{'Home' if side=='home' else 'Away'}",
                                       "book":_fmt_ah_book(ah_line, odd, side),
                                       "ev":float(evk),"kelly":float(kel),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(kel)})
         # 角球 OU 主盘
         ev, k = r.get("ev_crn_main_over"), r.get("kelly_crn_main_over")
-        if ev is not None and k is not None:
-            vi = value_index(ev, k)
+        if ev is not None and k is not None and r.get("quality_crn_main_over") == "keep":
+            vi = r.get("vi_crn_main_over")
+            vi = vi if vi is not None else value_index(ev, k)
             if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
                 picks.append({**base,"market":"CRN-Over","book":_fmt_ou_book(r.get("crn_main_line"), r.get("odds_crn_main_over"), True),
                               "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)})
         ev, k = r.get("ev_crn_main_under"), r.get("kelly_crn_main_under")
-        if ev is not None and k is not None:
-            vi = value_index(ev, k)
+        if ev is not None and k is not None and r.get("quality_crn_main_under") == "keep":
+            vi = r.get("vi_crn_main_under")
+            vi = vi if vi is not None else value_index(ev, k)
             if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
                 picks.append({**base,"market":"CRN-Under","book":_fmt_ou_book(r.get("crn_main_line"), r.get("odds_crn_main_under"), True),
                               "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)})
@@ -755,11 +919,25 @@ def build_ah_lines(odds: dict) -> dict:
             continue
 
         oround = _ou_overround(oh, oa)
-        out[str(float(ln))] = {
+        entry = {
             "home_median": float(oh), "away_median": float(oa),
             "home_cnt": int(cnt_h), "away_cnt": int(cnt_a),
             "overround": float(oround)
         }
+        bm_val = sides.get("bookmaker_count") if isinstance(sides, dict) else None
+        if bm_val is None:
+            entry["bookmaker_count"] = int(min(cnt_h, cnt_a))
+        else:
+            try:
+                entry["bookmaker_count"] = int(float(bm_val))
+            except (TypeError, ValueError):
+                entry["bookmaker_count"] = int(min(cnt_h, cnt_a))
+        if isinstance(sides, dict) and sides.get("max_update_minutes") is not None:
+            try:
+                entry["max_update_minutes"] = float(sides.get("max_update_minutes"))
+            except (TypeError, ValueError):
+                pass
+        out[str(float(ln))] = entry
     return out
 
 def select_best_ah_main(ah_lines: dict, strict: int = 1) -> tuple[float, float, float] | None:
@@ -853,6 +1031,8 @@ def main():
         except Exception as e:
             print(f"跳过一场（解析失败）：{e}"); continue
 
+        league_tier = classify_league_tier(league)
+
         league_avg = compute_league_avg_from_cache(league_id, season)
 
         h_st = TEAM_STATS_CACHE.get((league_id, season, home_id), {}) or {}
@@ -879,6 +1059,27 @@ def main():
 
         odds = odds_by_fixture(fx_id) if fx_id else {}
 
+        consensus_1x2 = {
+            "bookmakers": odds.get("1x2_bookmaker_count"),
+            "overround": odds.get("1x2_overround"),
+            "update": odds.get("1x2_max_update_minutes"),
+        }
+        consensus_ou_main = {
+            "bookmakers": odds.get("ou_main_bookmaker_count"),
+            "overround": odds.get("ou_main_overround"),
+            "update": odds.get("ou_main_max_update_minutes"),
+        }
+        consensus_ah_main = {
+            "bookmakers": odds.get("ah_bookmaker_count"),
+            "overround": odds.get("ah_overround"),
+            "update": odds.get("ah_max_update_minutes"),
+        }
+        consensus_crn_main = {
+            "bookmakers": odds.get("crn_main_bookmaker_count"),
+            "overround": odds.get("crn_main_overround"),
+            "update": odds.get("crn_main_max_update_minutes"),
+        }
+
         # ===== 1X2 =====
         o1_h,o1_d,o1_a = odds.get("1x2_home"),odds.get("1x2_draw"),odds.get("1x2_away")
         ev1_h=ev1_d=ev1_a=k1_h=k1_d=k1_a=None
@@ -890,6 +1091,10 @@ def main():
             ev1_a,k1_a = ev_kelly_binary(sim["p_away"], o1_a)
             if is_ev_outlier(max([x for x in (ev1_h,ev1_d,ev1_a) if x is not None], default=0)):
                 ev1_h=ev1_d=ev1_a=k1_h=k1_d=k1_a=None
+
+        ev1_h, k1_h, q1_h, qnote1_h, vi1_h = evaluate_market_value(ev1_h, k1_h, "1x2", league_tier, consensus_1x2)
+        ev1_d, k1_d, q1_d, qnote1_d, vi1_d = evaluate_market_value(ev1_d, k1_d, "1x2", league_tier, consensus_1x2)
+        ev1_a, k1_a, q1_a, qnote1_a, vi1_a = evaluate_market_value(ev1_a, k1_a, "1x2", league_tier, consensus_1x2)
 
         # ===== Goals OU 主盘 =====
         ou_main_line   = odds.get("ou_main_line")
@@ -910,6 +1115,9 @@ def main():
                 if is_ev_outlier(max([x for x in (ev_main_over, ev_main_under) if x is not None], default=0)):
                     ev_main_over = ev_main_under = k_main_over = k_main_under = None
 
+        ev_main_over, k_main_over, q_ou_main_over, qnote_ou_main_over, vi_ou_main_over = evaluate_market_value(ev_main_over, k_main_over, "ou", league_tier, consensus_ou_main)
+        ev_main_under, k_main_under, q_ou_main_under, qnote_ou_main_under, vi_ou_main_under = evaluate_market_value(ev_main_under, k_main_under, "ou", league_tier, consensus_ou_main)
+
         # ===== OU@2.5 参考 =====
         o25_over,o25_under = odds.get("ou_over_2_5"),odds.get("ou_under_2_5")
         ev25_over=ev25_under=k25_over=k25_under=None
@@ -921,6 +1129,20 @@ def main():
             ev25_under, k25_under = res25["EV_under"], res25["Kelly_under"]
             if is_ev_outlier(max([x for x in (ev25_over,ev25_under) if x is not None], default=0)):
                 ev25_over=ev25_under=k25_over=k25_under=None
+
+        ou_lines_data = odds.get("ou_lines") or {}
+        info_25 = None
+        for key in ("2.5", str(2.5)):
+            if key in ou_lines_data:
+                info_25 = ou_lines_data[key]
+                break
+        consensus_ou_25 = {
+            "bookmakers": (info_25 or {}).get("bookmaker_count") or (info_25 or {}).get("bookmakers"),
+            "overround": (info_25 or {}).get("overround"),
+            "update": (info_25 or {}).get("max_update_minutes"),
+        }
+        ev25_over, k25_over, q_ou25_over, qnote_ou25_over, vi_ou25_over = evaluate_market_value(ev25_over, k25_over, "ou", league_tier, consensus_ou_25)
+        ev25_under, k25_under, q_ou25_under, qnote_ou25_under, vi_ou25_under = evaluate_market_value(ev25_under, k25_under, "ou", league_tier, consensus_ou_25)
 
         # ===== AH 全线（统一归一）
         ah_lines = build_ah_lines(odds)
@@ -943,9 +1165,14 @@ def main():
                 ev_ah_a, k_ah_a = evk["away"].get("EV"), evk["away"].get("Kelly")
             if is_ev_outlier(max([x for x in (ev_ah_h, ev_ah_a) if x is not None], default=0)):
                 ev_ah_h = ev_ah_a = k_ah_h = k_ah_a = None
-            else:
-                if ev_ah_h is not None: cnt_ah_ev_home += 1
-                if ev_ah_a is not None: cnt_ah_ev_away += 1
+
+        ev_ah_h, k_ah_h, q_ah_home, qnote_ah_home, vi_ah_home = evaluate_market_value(ev_ah_h, k_ah_h, "ah", league_tier, consensus_ah_main)
+        ev_ah_a, k_ah_a, q_ah_away, qnote_ah_away, vi_ah_away = evaluate_market_value(ev_ah_a, k_ah_a, "ah", league_tier, consensus_ah_main)
+
+        if ev_ah_h is not None:
+            cnt_ah_ev_home += 1
+        if ev_ah_a is not None:
+            cnt_ah_ev_away += 1
 
         # ===== 角球 OU 主盘 =====
         crn_main_line  = odds.get("crn_main_line")
@@ -971,8 +1198,11 @@ def main():
                 if is_ev_outlier(max([x for x in (ev_crn_over,ev_crn_under) if x is not None], default=0)):
                     ev_crn_over = ev_crn_under = k_crn_over = k_crn_under = None
 
+        ev_crn_over, k_crn_over, q_crn_over, qnote_crn_over, vi_crn_over = evaluate_market_value(ev_crn_over, k_crn_over, "derivative", league_tier, consensus_crn_main)
+        ev_crn_under, k_crn_under, q_crn_under, qnote_crn_under, vi_crn_under = evaluate_market_value(ev_crn_under, k_crn_under, "derivative", league_tier, consensus_crn_main)
+
         # ===== 全线榜单池 & 盘口矩阵（优先使用 *_lines；无则回退 _raw_*） =====
-        ou_lines = odds.get("ou_lines") or {}
+        ou_lines = dict(ou_lines_data)
         crn_lines = odds.get("crn_lines") or {}
         # —— AH 用统一归一后的
         #   ah_lines 已在上面 build_ah_lines(odds) 生成
@@ -1000,13 +1230,38 @@ def main():
             om, um = info.get("over_median"), info.get("under_median")
             oround = info.get("overround", 9.9)
             if om is None or um is None or not (1.00 <= float(oround) <= 1.25): continue
+            consensus_line = {
+                "bookmakers": info.get("bookmaker_count") or info.get("bookmakers"),
+                "overround": info.get("overround"),
+                "update": info.get("max_update_minutes"),
+            }
             resL = ou_ev_kelly_from_totals_quarter(line, float(om), float(um), totals)
             if resL["EV_over"] is not None and resL["Kelly_over"] is not None:
-                vi = value_index(resL["EV_over"], resL["Kelly_over"])
-                ou_all_over.append((vi, home_name, away_name, line, float(om), resL["EV_over"], resL["Kelly_over"]))
+                ev_f, k_f, q_line, _, vi_line = evaluate_market_value(resL["EV_over"], resL["Kelly_over"], "ou", league_tier, consensus_line)
+                if ev_f is not None and vi_line is not None:
+                    ou_all_over.append({
+                        "vi": vi_line,
+                        "home": home_name,
+                        "away": away_name,
+                        "line": float(line),
+                        "odds": float(om),
+                        "ev": ev_f,
+                        "kelly": k_f,
+                        "quality": q_line,
+                    })
             if resL["EV_under"] is not None and resL["Kelly_under"] is not None:
-                vi = value_index(resL["EV_under"], resL["Kelly_under"])
-                ou_all_under.append((vi, home_name, away_name, line, float(um), resL["EV_under"], resL["Kelly_under"]))
+                ev_f, k_f, q_line, _, vi_line = evaluate_market_value(resL["EV_under"], resL["Kelly_under"], "ou", league_tier, consensus_line)
+                if ev_f is not None and vi_line is not None:
+                    ou_all_under.append({
+                        "vi": vi_line,
+                        "home": home_name,
+                        "away": away_name,
+                        "line": float(line),
+                        "odds": float(um),
+                        "ev": ev_f,
+                        "kelly": k_f,
+                        "quality": q_line,
+                    })
 
         # —— 全线榜单池（CRN）
         if crn_totals_list is None:
@@ -1019,13 +1274,38 @@ def main():
             om, um = info.get("over_median"), info.get("under_median")
             oround = info.get("overround", 9.9)
             if om is None or um is None or not (1.00 <= float(oround) <= 1.30): continue
+            consensus_line = {
+                "bookmakers": info.get("bookmaker_count") or info.get("bookmakers"),
+                "overround": info.get("overround"),
+                "update": info.get("max_update_minutes"),
+            }
             resCL = ou_ev_kelly_from_totals_quarter(line, float(om), float(um), crn_totals_list)
             if resCL["EV_over"] is not None and resCL["Kelly_over"] is not None:
-                vi = value_index(resCL["EV_over"], resCL["Kelly_over"])
-                crn_all_over.append((vi, home_name, away_name, line, float(om), resCL["EV_over"], resCL["Kelly_over"]))
+                ev_f, k_f, q_line, _, vi_line = evaluate_market_value(resCL["EV_over"], resCL["Kelly_over"], "derivative", league_tier, consensus_line)
+                if ev_f is not None and vi_line is not None:
+                    crn_all_over.append({
+                        "vi": vi_line,
+                        "home": home_name,
+                        "away": away_name,
+                        "line": float(line),
+                        "odds": float(om),
+                        "ev": ev_f,
+                        "kelly": k_f,
+                        "quality": q_line,
+                    })
             if resCL["EV_under"] is not None and resCL["Kelly_under"] is not None:
-                vi = value_index(resCL["EV_under"], resCL["Kelly_under"])
-                crn_all_under.append((vi, home_name, away_name, line, float(um), resCL["EV_under"], resCL["Kelly_under"]))
+                ev_f, k_f, q_line, _, vi_line = evaluate_market_value(resCL["EV_under"], resCL["Kelly_under"], "derivative", league_tier, consensus_line)
+                if ev_f is not None and vi_line is not None:
+                    crn_all_under.append({
+                        "vi": vi_line,
+                        "home": home_name,
+                        "away": away_name,
+                        "line": float(line),
+                        "odds": float(um),
+                        "ev": ev_f,
+                        "kelly": k_f,
+                        "quality": q_line,
+                    })
 
         # —— 全线榜单池（AH）
         for sline, info in (ah_lines.items() if isinstance(ah_lines, dict) else []):
@@ -1034,14 +1314,39 @@ def main():
             oh, oa = info.get("home_median"), info.get("away_median")
             oround = info.get("overround", 9.9)
             if oh is None or oa is None or not (1.00 <= float(oround) <= 1.25): continue
+            consensus_line = {
+                "bookmakers": info.get("bookmaker_count") or info.get("bookmakers"),
+                "overround": info.get("overround"),
+                "update": info.get("max_update_minutes"),
+            }
             probs = ah_probabilities_from_lams(lam_home, lam_away, h=float(line), n_sims=N_SIMS_GOALS)
             evk = ah_ev_kelly(probs, odds_home=float(oh), odds_away=float(oa))
             if isinstance(evk.get("home"), dict) and evk["home"]["EV"] is not None and evk["home"]["Kelly"] is not None:
-                vi = value_index(evk["home"]["EV"], evk["home"]["Kelly"])
-                ah_all_home.append((vi, home_name, away_name, line, float(oh), evk["home"]["EV"], evk["home"]["Kelly"]))
+                ev_f, k_f, q_line, _, vi_line = evaluate_market_value(evk["home"]["EV"], evk["home"]["Kelly"], "ah", league_tier, consensus_line)
+                if ev_f is not None and vi_line is not None:
+                    ah_all_home.append({
+                        "vi": vi_line,
+                        "home": home_name,
+                        "away": away_name,
+                        "line": float(line),
+                        "odds": float(oh),
+                        "ev": ev_f,
+                        "kelly": k_f,
+                        "quality": q_line,
+                    })
             if isinstance(evk.get("away"), dict) and evk["away"]["EV"] is not None and evk["away"]["Kelly"] is not None:
-                vi = value_index(evk["away"]["EV"], evk["away"]["Kelly"])
-                ah_all_away.append((vi, home_name, away_name, line, float(oa), evk["away"]["EV"], evk["away"]["Kelly"]))
+                ev_f, k_f, q_line, _, vi_line = evaluate_market_value(evk["away"]["EV"], evk["away"]["Kelly"], "ah", league_tier, consensus_line)
+                if ev_f is not None and vi_line is not None:
+                    ah_all_away.append({
+                        "vi": vi_line,
+                        "home": home_name,
+                        "away": away_name,
+                        "line": float(line),
+                        "odds": float(oa),
+                        "ev": ev_f,
+                        "kelly": k_f,
+                        "quality": q_line,
+                    })
 
         # ===== 盘口矩阵（用 *_lines 导出） =====
         for sline, info in ou_lines.items():
@@ -1049,14 +1354,16 @@ def main():
             except: continue
             om, um = info.get("over_median"), info.get("under_median")
             if om is None or um is None: continue
-            matrix_rows.append({
-                "date_utc": date_str, "kickoff_utc": kickoff_utc, "league": league_name,
-                "home": home_name, "away": away_name,
-                "market": "OU", "line": float(line),
-                "median_over": float(om), "median_under": float(um),
-                "cnt_over": int(info.get("over_cnt", 0)), "cnt_under": int(info.get("under_cnt", 0)),
-                "overround": float(info.get("overround", 9.9))
-            })
+                matrix_rows.append({
+                    "date_utc": date_str, "kickoff_utc": kickoff_utc, "league": league_name,
+                    "home": home_name, "away": away_name,
+                    "market": "OU", "line": float(line),
+                    "median_over": float(om), "median_under": float(um),
+                    "cnt_over": int(info.get("over_cnt", 0)), "cnt_under": int(info.get("under_cnt", 0)),
+                    "overround": float(info.get("overround", 9.9)),
+                    "bookmaker_count": int((info.get("bookmaker_count") or info.get("bookmakers") or 0)),
+                    "max_update_minutes": info.get("max_update_minutes"),
+                })
         for sline, info in crn_lines.items():
             try: line = float(sline)
             except: continue
@@ -1068,7 +1375,9 @@ def main():
                 "market": "CRN", "line": float(line),
                 "median_over": float(om), "median_under": float(um),
                 "cnt_over": int(info.get("over_cnt", 0)), "cnt_under": int(info.get("under_cnt", 0)),
-                "overround": float(info.get("overround", 9.9))
+                "overround": float(info.get("overround", 9.9)),
+                "bookmaker_count": int((info.get("bookmaker_count") or info.get("bookmakers") or 0)),
+                "max_update_minutes": info.get("max_update_minutes"),
             })
         for sline, info in ah_lines.items():
             try: line = float(sline)
@@ -1081,22 +1390,38 @@ def main():
                 "market": "AH", "line": float(line),
                 "median_home": float(oh), "median_away": float(oa),
                 "cnt_home": int(info.get("home_cnt", 0)), "cnt_away": int(info.get("away_cnt", 0)),
-                "overround": float(info.get("overround", 9.9))
+                "overround": float(info.get("overround", 9.9)),
+                "bookmaker_count": int((info.get("bookmaker_count") or info.get("bookmakers") or 0)),
+                "max_update_minutes": info.get("max_update_minutes"),
             })
 
         # ===== 综合最佳 =====
+        allowed_quality = {"keep", "review", "review_high"}
+        cands: List[Tuple[float, str, float, float]] = []
+
+        def _add_candidate(label: Optional[str], ev: Optional[float], kelly: Optional[float], vi: Optional[float], quality: str) -> None:
+            if not label:
+                return
+            if quality not in allowed_quality:
+                return
+            if ev is None or kelly is None or vi is None:
+                return
+            cands.append((float(vi), str(label), float(ev), float(kelly)))
+
         cands = []
-        for label,ev,k in [
-            ("1X2-Home", ev1_h, k1_h), ("1X2-Draw", ev1_d, k1_d), ("1X2-Away", ev1_a, k1_a),
-            ("OU(main)-Over", ev_main_over, k_main_over), ("OU(main)-Under", ev_main_under, k_main_under),
-            ("OU2.5-Over", ev25_over, k25_over), ("OU2.5-Under", ev25_under, k25_under),
-            (f"AH({ah_line:+})-Home" if ah_line is not None else None, ev_ah_h, k_ah_h),
-            (f"AH({ah_line:+})-Away" if ah_line is not None else None, ev_ah_a, k_ah_a),
-            (f"CRN({crn_main_line})-Over" if crn_main_line is not None else None, ev_crn_over, k_crn_over),
-            (f"CRN({crn_main_line})-Under" if crn_main_line is not None else None, ev_crn_under, k_crn_under),
-        ]:
-            if label and ev is not None and k is not None:
-                cands.append((value_index(ev,k), label, ev, k))
+        _add_candidate("1X2-Home", ev1_h, k1_h, vi1_h, q1_h)
+        _add_candidate("1X2-Draw", ev1_d, k1_d, vi1_d, q1_d)
+        _add_candidate("1X2-Away", ev1_a, k1_a, vi1_a, q1_a)
+        _add_candidate("OU(main)-Over", ev_main_over, k_main_over, vi_ou_main_over, q_ou_main_over)
+        _add_candidate("OU(main)-Under", ev_main_under, k_main_under, vi_ou_main_under, q_ou_main_under)
+        _add_candidate("OU2.5-Over", ev25_over, k25_over, vi_ou25_over, q_ou25_over)
+        _add_candidate("OU2.5-Under", ev25_under, k25_under, vi_ou25_under, q_ou25_under)
+        if ah_line is not None:
+            _add_candidate(f"AH({ah_line:+})-Home", ev_ah_h, k_ah_h, vi_ah_home, q_ah_home)
+            _add_candidate(f"AH({ah_line:+})-Away", ev_ah_a, k_ah_a, vi_ah_away, q_ah_away)
+        if crn_main_line is not None:
+            _add_candidate(f"CRN({crn_main_line})-Over", ev_crn_over, k_crn_over, vi_crn_over, q_crn_over)
+            _add_candidate(f"CRN({crn_main_line})-Under", ev_crn_under, k_crn_under, vi_crn_under, q_crn_under)
         cands.sort(key=lambda x: x[0], reverse=True)
         best_label = cands[0][1] if cands else None
         best_ev    = cands[0][2] if cands else None
@@ -1116,10 +1441,18 @@ def main():
             "p_home": round(sim["p_home"],4), "p_draw": round(sim["p_draw"],4), "p_away": round(sim["p_away"],4),
             "p_over2.5": round(sim["p_over"],4), "p_under2.5": round(sim["p_under"],4),
 
+            "league_tier": league_tier,
+
+            "1x2_bookmaker_count": consensus_1x2.get("bookmakers"),
+            "1x2_overround": consensus_1x2.get("overround"),
+            "1x2_update_minutes": consensus_1x2.get("update"),
+
             # Goals OU 主盘（含诊断 + EV）
             "ou_main_line": ou_main_line,
             "odds_ou_main_over": ou_main_over, "odds_ou_main_under": ou_main_under,
             "ou_main_over_cnt": ou_cnt_o, "ou_main_under_cnt": ou_cnt_u, "ou_main_overround": ou_overround,
+            "ou_main_bookmaker_count": consensus_ou_main.get("bookmakers"),
+            "ou_main_update_minutes": consensus_ou_main.get("update"),
             "ev_ou_main_over": ev_main_over, "kelly_ou_main_over": k_main_over,
             "ev_ou_main_under": ev_main_under, "kelly_ou_main_under": k_main_under,
 
@@ -1135,6 +1468,8 @@ def main():
 
             # AH（含诊断 + EV）
             "ah_line": ah_line, "odds_ah_home": ah_oh, "odds_ah_away": ah_oa,
+            "ah_bookmaker_count": consensus_ah_main.get("bookmakers"),
+            "ah_update_minutes": consensus_ah_main.get("update"),
             "ev_ah_home": ev_ah_h, "kelly_ah_home": k_ah_h,
             "ev_ah_away": ev_ah_a, "kelly_ah_away": k_ah_a,
 
@@ -1142,12 +1477,36 @@ def main():
             "crn_main_line": crn_main_line,
             "odds_crn_main_over": crn_main_over, "odds_crn_main_under": crn_main_under,
             "crn_main_over_cnt": crn_cnt_o, "crn_main_under_cnt": crn_cnt_u, "crn_main_overround": crn_overround,
+            "crn_main_bookmaker_count": consensus_crn_main.get("bookmakers"),
+            "crn_main_update_minutes": consensus_crn_main.get("update"),
             "ev_crn_main_over": ev_crn_over, "kelly_crn_main_over": k_crn_over,
             "ev_crn_main_under": ev_crn_under, "kelly_crn_main_under": k_crn_under,
 
             "best_market": best_label, "best_ev": best_ev, "best_kelly": best_kelly,
             "value_index": value_index(best_ev, best_kelly) if (best_ev is not None and best_kelly is not None) else None
         }
+
+        row["quality_1x2_home"], row["quality_1x2_draw"], row["quality_1x2_away"] = q1_h, q1_d, q1_a
+        row["quality_ou_main_over"], row["quality_ou_main_under"] = q_ou_main_over, q_ou_main_under
+        row["quality_ou_over2.5"], row["quality_ou_under2.5"] = q_ou25_over, q_ou25_under
+        row["quality_ah_home"], row["quality_ah_away"] = q_ah_home, q_ah_away
+        row["quality_crn_main_over"], row["quality_crn_main_under"] = q_crn_over, q_crn_under
+
+        row["vi_1x2_home"], row["vi_1x2_draw"], row["vi_1x2_away"] = vi1_h, vi1_d, vi1_a
+        row["vi_ou_main_over"], row["vi_ou_main_under"] = vi_ou_main_over, vi_ou_main_under
+        row["vi_ou_over2.5"], row["vi_ou_under2.5"] = vi_ou25_over, vi_ou25_under
+        row["vi_ah_home"], row["vi_ah_away"] = vi_ah_home, vi_ah_away
+        row["vi_crn_main_over"], row["vi_crn_main_under"] = vi_crn_over, vi_crn_under
+
+        for label, note in [
+            ("1x2_home", qnote1_h), ("1x2_draw", qnote1_d), ("1x2_away", qnote1_a),
+            ("ou_main_over", qnote_ou_main_over), ("ou_main_under", qnote_ou_main_under),
+            ("ou_over2.5", qnote_ou25_over), ("ou_under2.5", qnote_ou25_under),
+            ("ah_home", qnote_ah_home), ("ah_away", qnote_ah_away),
+            ("crn_main_over", qnote_crn_over), ("crn_main_under", qnote_crn_under),
+        ]:
+            if note:
+                row[f"quality_{label}_note"] = note
 
         if lam_detail:
             row["lam_blend_detail"] = lam_detail
@@ -1166,15 +1525,26 @@ def main():
     base_order = [
         "date_utc","kickoff_utc","league","home","away",
         "lam_home","lam_away","lam_weight_season","lam_weight_recent","lam_blend_detail",
-        "p_home","p_draw","p_away","p_over2.5","p_under2.5",
+        "p_home","p_draw","p_away","p_over2.5","p_under2.5","league_tier",
+        "1x2_bookmaker_count","1x2_overround","1x2_update_minutes",
         "ou_main_line","odds_ou_main_over","odds_ou_main_under",
-        "ou_main_over_cnt","ou_main_under_cnt","ou_main_overround",
-        "ev_ou_main_over","kelly_ou_main_over","ev_ou_main_under","kelly_ou_main_under",
-        "odds_ou_over2.5","odds_ou_under2.5","ev_ou_over2.5","kelly_ou_over2.5","ev_ou_under2.5","kelly_ou_under2.5",
-        "odds_1x2_home","odds_1x2_draw","odds_1x2_away","ev_1x2_home","kelly_1x2_home","ev_1x2_draw","kelly_1x2_draw","ev_1x2_away","kelly_1x2_away",
-        "ah_line","odds_ah_home","odds_ah_away","ev_ah_home","kelly_ah_home","ev_ah_away","kelly_ah_away",
-        "crn_main_line","odds_crn_main_over","odds_crn_main_under","crn_main_over_cnt","crn_main_under_cnt","crn_main_overround",
-        "ev_crn_main_over","kelly_crn_main_over","ev_crn_main_under","kelly_crn_main_under",
+        "ou_main_over_cnt","ou_main_under_cnt","ou_main_overround","ou_main_bookmaker_count","ou_main_update_minutes",
+        "ev_ou_main_over","kelly_ou_main_over","quality_ou_main_over","vi_ou_main_over",
+        "ev_ou_main_under","kelly_ou_main_under","quality_ou_main_under","vi_ou_main_under",
+        "odds_ou_over2.5","odds_ou_under2.5",
+        "ev_ou_over2.5","kelly_ou_over2.5","quality_ou_over2.5","vi_ou_over2.5",
+        "ev_ou_under2.5","kelly_ou_under2.5","quality_ou_under2.5","vi_ou_under2.5",
+        "odds_1x2_home","odds_1x2_draw","odds_1x2_away",
+        "ev_1x2_home","kelly_1x2_home","quality_1x2_home","vi_1x2_home",
+        "ev_1x2_draw","kelly_1x2_draw","quality_1x2_draw","vi_1x2_draw",
+        "ev_1x2_away","kelly_1x2_away","quality_1x2_away","vi_1x2_away",
+        "ah_line","odds_ah_home","odds_ah_away","ah_bookmaker_count","ah_update_minutes",
+        "ev_ah_home","kelly_ah_home","quality_ah_home","vi_ah_home",
+        "ev_ah_away","kelly_ah_away","quality_ah_away","vi_ah_away",
+        "crn_main_line","odds_crn_main_over","odds_crn_main_under",
+        "crn_main_over_cnt","crn_main_under_cnt","crn_main_overround","crn_main_bookmaker_count","crn_main_update_minutes",
+        "ev_crn_main_over","kelly_crn_main_over","quality_crn_main_over","vi_crn_main_over",
+        "ev_crn_main_under","kelly_crn_main_under","quality_crn_main_under","vi_crn_main_under",
         "best_market","best_ev","best_kelly","value_index"
     ]
     all_keys=set(); [all_keys.update(r.keys()) for r in rows_all]
@@ -1186,12 +1556,13 @@ def main():
 
     # ===== 导出盘口矩阵（来自 *_lines） =====
     out_mat = os.path.join(out_dir, f"daily_brief_matrix_{date_str}.csv")
-    if matrix_rows:
-        mat_fields = [
-            "date_utc","kickoff_utc","league","home","away","market","line",
-            "median_over","median_under","median_home","median_away",
-            "cnt_over","cnt_under","cnt_home","cnt_away","overround"
-        ]
+        if matrix_rows:
+            mat_fields = [
+                "date_utc","kickoff_utc","league","home","away","market","line",
+                "median_over","median_under","median_home","median_away",
+                "cnt_over","cnt_under","cnt_home","cnt_away","overround",
+                "bookmaker_count","max_update_minutes"
+            ]
         with open(out_mat, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=mat_fields, extrasaction="ignore")
             w.writeheader(); [w.writerow(r) for r in matrix_rows]
@@ -1200,17 +1571,26 @@ def main():
         print("未获取到盘口矩阵（ou_lines/crn_lines/ah_lines），跳过导出。")
 
     # ===== 榜单打印 =====
-    def top_list(rows: List[Dict], key_ev: str, key_k: str, label: str, suffix_fn=None):
+    allowed_quality = {"keep", "review", "review_high"}
+
+    def top_list(rows: List[Dict], key_ev: str, key_k: str, label: str, suffix_fn=None, quality_key: Optional[str] = None, vi_key: Optional[str] = None):
         items = []
         for r in rows:
             ev,k = r.get(key_ev), r.get(key_k)
             if ev is None or k is None or ev < MIN_EV: continue
-            items.append((value_index(ev,k), r, ev, k))
+            quality = r.get(quality_key) if quality_key else "keep"
+            if quality_key and quality not in allowed_quality:
+                continue
+            vi = r.get(vi_key) if vi_key else value_index(ev,k)
+            if vi is None:
+                continue
+            items.append((float(vi), r, ev, k, quality))
         items.sort(key=lambda x: x[0], reverse=True)
         print(f"\n=== Top {min(TOP_K, len(items))}（{label}，EV≥{MIN_EV:.2f}） ===")
-        for i,(_,r,ev,k) in enumerate(items[:TOP_K], 1):
+        for i,(vi,r,ev,k,quality) in enumerate(items[:TOP_K], 1):
             extra = suffix_fn(r) if suffix_fn else ""
-            print(f"[{i:02d}] {r['home']} vs {r['away']} | EV={ev:.3f} Kelly≈{k:.3f} | {label}{(' ' + extra) if extra else ''}")
+            tag = "" if quality == "keep" else f" [{quality}]"
+            print(f"[{i:02d}] {r['home']} vs {r['away']} | EV={ev:.3f} Kelly≈{k:.3f} | {label}{(' ' + extra) if extra else ''}{tag}")
 
     # Suffix 生成（去掉多余空格）
     suf_ou_over  = lambda r: _fmt_ou_book(r.get("ou_main_line"), r.get("odds_ou_main_over"), False)
@@ -1223,32 +1603,50 @@ def main():
     suf_cr_over  = lambda r: _fmt_ou_book(r.get("crn_main_line"), r.get("odds_crn_main_over"), True)
     suf_cr_under = lambda r: _fmt_ou_book(r.get("crn_main_line"), r.get("odds_crn_main_under"), True)
 
-    top_list(rows_all, "ev_ou_main_over",  "kelly_ou_main_over",  "OU主盘-Over",  suf_ou_over)
-    top_list(rows_all, "ev_ou_main_under", "kelly_ou_main_under", "OU主盘-Under", suf_ou_under)
-    top_list(rows_all, "ev_1x2_home", "kelly_1x2_home", "1X2-主胜", suf_1x2_home)
-    top_list(rows_all, "ev_1x2_draw", "kelly_1x2_draw", "1X2-平局", suf_1x2_draw)
-    top_list(rows_all, "ev_1x2_away", "kelly_1x2_away", "1X2-客胜", suf_1x2_away)
-    top_list(rows_all, "ev_ah_home", "kelly_ah_home", "AH-主方向", suf_ah_home)
-    top_list(rows_all, "ev_ah_away", "kelly_ah_away", "AH-客方向", suf_ah_away)
-    top_list(rows_all, "ev_crn_main_over",  "kelly_crn_main_over",  "角球主盘-Over",  suf_cr_over)
-    top_list(rows_all, "ev_crn_main_under", "kelly_crn_main_under", "角球主盘-Under", suf_cr_under)
+    top_list(rows_all, "ev_ou_main_over",  "kelly_ou_main_over",  "OU主盘-Over",  suf_ou_over, quality_key="quality_ou_main_over", vi_key="vi_ou_main_over")
+    top_list(rows_all, "ev_ou_main_under", "kelly_ou_main_under", "OU主盘-Under", suf_ou_under, quality_key="quality_ou_main_under", vi_key="vi_ou_main_under")
+    top_list(rows_all, "ev_1x2_home", "kelly_1x2_home", "1X2-主胜", suf_1x2_home, quality_key="quality_1x2_home", vi_key="vi_1x2_home")
+    top_list(rows_all, "ev_1x2_draw", "kelly_1x2_draw", "1X2-平局", suf_1x2_draw, quality_key="quality_1x2_draw", vi_key="vi_1x2_draw")
+    top_list(rows_all, "ev_1x2_away", "kelly_1x2_away", "1X2-客胜", suf_1x2_away, quality_key="quality_1x2_away", vi_key="vi_1x2_away")
+    top_list(rows_all, "ev_ah_home", "kelly_ah_home", "AH-主方向", suf_ah_home, quality_key="quality_ah_home", vi_key="vi_ah_home")
+    top_list(rows_all, "ev_ah_away", "kelly_ah_away", "AH-客方向", suf_ah_away, quality_key="quality_ah_away", vi_key="vi_ah_away")
+    top_list(rows_all, "ev_crn_main_over",  "kelly_crn_main_over",  "角球主盘-Over",  suf_cr_over, quality_key="quality_crn_main_over", vi_key="vi_crn_main_over")
+    top_list(rows_all, "ev_crn_main_under", "kelly_crn_main_under", "角球主盘-Under", suf_cr_under, quality_key="quality_crn_main_under", vi_key="vi_crn_main_under")
 
     # ===== 全线 Top（按 VI 排序）=====
-    def print_ou_crn_allline_top(title: str, arr: List[tuple], tag="OU"):
+    def print_ou_crn_allline_top(title: str, arr: List[Dict[str, object]], tag="OU"):
         print(f"\n=== 全线 Top {TOP_K}（{title}，EV≥{MIN_EV:.2f}） ===")
-        arr2 = [(vi,h,a,line,od,ev,k) for (vi,h,a,line,od,ev,k) in arr if ev is not None and k is not None and ev >= MIN_EV]
-        arr2.sort(key=lambda x: x[0], reverse=True)
-        for i,(vi,h,a,line,od,ev,k) in enumerate(arr2[:TOP_K],1):
-            print(f"[{i:02d}] {h} vs {a} | 线={line:g} | EV={ev:.3f} Kelly≈{k:.3f} | {title} {tag}{line:g}@{od:.2f}")
+        arr2 = [
+            entry for entry in arr
+            if entry.get("ev") is not None and entry.get("kelly") is not None and entry.get("ev", 0) >= MIN_EV
+            and entry.get("quality") in allowed_quality and entry.get("vi") is not None
+        ]
+        arr2.sort(key=lambda x: float(x.get("vi", -999)), reverse=True)
+        for i, entry in enumerate(arr2[:TOP_K], 1):
+            quality = entry.get("quality", "")
+            tag_q = "" if quality == "keep" else f" [{quality}]"
+            print(
+                f"[{i:02d}] {entry['home']} vs {entry['away']} | 线={entry['line']:g} | EV={entry['ev']:.3f} "
+                f"Kelly≈{entry['kelly']:.3f} | {title} {tag}{entry['line']:g}@{entry['odds']:.2f}{tag_q}"
+            )
 
-    def print_ah_allline_top(title: str, arr: List[tuple], side="home"):
+    def print_ah_allline_top(title: str, arr: List[Dict[str, object]], side="home"):
         print(f"\n=== 全线 Top {TOP_K}（{title}，EV≥{MIN_EV:.2f}） ===")
-        arr2 = [(vi,h,a,line,od,ev,k) for (vi,h,a,line,od,ev,k) in arr if ev is not None and k is not None and ev >= MIN_EV]
-        arr2.sort(key=lambda x: x[0], reverse=True)
-        for i,(vi,h,a,line,od,ev,k) in enumerate(arr2[:TOP_K],1):
-            adj = line if side=="home" else -line
-            sign = "+" if adj>0 else ""
-            print(f"[{i:02d}] {h} vs {a} | 线={adj:g} | EV={ev:.3f} Kelly≈{k:.3f} | {title} AH{sign}{adj:g}@{od:.2f}")
+        arr2 = [
+            entry for entry in arr
+            if entry.get("ev") is not None and entry.get("kelly") is not None and entry.get("ev", 0) >= MIN_EV
+            and entry.get("quality") in allowed_quality and entry.get("vi") is not None
+        ]
+        arr2.sort(key=lambda x: float(x.get("vi", -999)), reverse=True)
+        for i, entry in enumerate(arr2[:TOP_K], 1):
+            adj = entry["line"] if side == "home" else -entry["line"]
+            sign = "+" if adj > 0 else ""
+            quality = entry.get("quality", "")
+            tag_q = "" if quality == "keep" else f" [{quality}]"
+            print(
+                f"[{i:02d}] {entry['home']} vs {entry['away']} | 线={adj:g} | EV={entry['ev']:.3f} "
+                f"Kelly≈{entry['kelly']:.3f} | {title} AH{sign}{adj:g}@{entry['odds']:.2f}{tag_q}"
+            )
 
     if ou_all_over:  print_ou_crn_allline_top("进球OU-Over（全线）",  ou_all_over,  "OU")
     if ou_all_under: print_ou_crn_allline_top("进球OU-Under（全线）", ou_all_under, "OU")
