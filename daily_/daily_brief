@@ -13,6 +13,11 @@ from src.data.transform import league_goal_averages
 from src.models.poisson_mc import expected_goals_from_strengths, monte_carlo_simulate, simulate_goals
 from src.markets.asian_handicap import ah_probabilities_from_lams, ah_ev_kelly
 from src.config import HOME_ADV
+from daily_.value_engine import (
+    classify_league_tier,
+    evaluate_ev_market,
+    value_index as ve_value_index,
+)
 
 # ================== 可调参数 ==================
 FAST_MODE = 1
@@ -39,7 +44,7 @@ EXCLUDE_NOISY = 0
 EXCLUDE_KEYS = ["u21","u23","res.","reserve","friendly","club friendlies"]
 
 TOP_K  = 10
-MIN_EV = 0.00
+MIN_EV = 0.02
 
 # 角球 λ 兜底
 CORNER_BASE = 7.5
@@ -125,8 +130,47 @@ def ev_kelly_binary(p: float, odds: float) -> Tuple[float, float]:
     return float(EV), float(K)
 
 def value_index(ev: float | None, kelly: float | None) -> float:
-    if ev is None or kelly is None: return -999.0
-    return float(ev * math.sqrt(max(0.0, kelly)))
+    vi = ve_value_index(ev, kelly)
+    if vi is None:
+        return -999.0
+    return float(vi)
+
+
+def apply_ev_filter(
+    key: str,
+    ev: float | None,
+    kelly: float | None,
+    market: str,
+    tier: str,
+    *,
+    min_bookmakers: int | None,
+    overround: float | None,
+    update_age: float | None,
+    flag_map: Dict[str, str],
+    reason_map: Dict[str, str],
+    vi_map: Dict[str, float | None],
+) -> tuple[float | None, float | None]:
+    if ev is None or kelly is None:
+        flag_map[key] = "invalid"
+        vi_map[key] = None
+        return None, None
+
+    res = evaluate_ev_market(
+        ev,
+        kelly,
+        market,
+        tier,
+        min_bookmakers=min_bookmakers,
+        overround=overround,
+        update_age=update_age,
+    )
+    flag = res.get("tag", "invalid")
+    flag_map[key] = flag
+    reasons = res.get("reasons") or ()
+    if reasons:
+        reason_map[key] = ",".join(str(r) for r in reasons)
+    vi_map[key] = res.get("value_index")
+    return res.get("ev"), res.get("kelly")
 
 # ===== 四分之一盘精结算（基于 totals 样本）=====
 def ou_ev_kelly_from_totals_quarter(line: float, over_odds: float, under_odds: float, totals) -> dict:
@@ -624,13 +668,13 @@ def export_picks(rows_all: List[Dict], date_str: str):
                 "league": r.get("league"), "home": r.get("home"), "away": r.get("away")}
         # Goals OU 主盘
         ev, k = r.get("ev_ou_main_over"), r.get("kelly_ou_main_over")
-        if ev is not None and k is not None:
+        if ev is not None and k is not None and r.get("flag_ev_ou_main_over") == "keep":
             vi = value_index(ev, k)
             if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
                 picks.append({**base, "market":"OU-Over", "book":_fmt_ou_book(r.get("ou_main_line"), r.get("odds_ou_main_over"), False),
                               "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)})
         ev, k = r.get("ev_ou_main_under"), r.get("kelly_ou_main_under")
-        if ev is not None and k is not None:
+        if ev is not None and k is not None and r.get("flag_ev_ou_main_under") == "keep":
             vi = value_index(ev, k)
             if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
                 picks.append({**base, "market":"OU-Under", "book":_fmt_ou_book(r.get("ou_main_line"), r.get("odds_ou_main_under"), False),
@@ -641,7 +685,8 @@ def export_picks(rows_all: List[Dict], date_str: str):
             ("1X2-Draw", r.get("ev_1x2_draw"), r.get("kelly_1x2_draw"), r.get("odds_1x2_draw")),
             ("1X2-Away", r.get("ev_1x2_away"), r.get("kelly_1x2_away"), r.get("odds_1x2_away")),
         ]:
-            if evk is not None and kel is not None and odd is not None:
+            flag_key = f"flag_{'ev_1x2_home' if mk=='1X2-Home' else 'ev_1x2_draw' if mk=='1X2-Draw' else 'ev_1x2_away'}"
+            if evk is not None and kel is not None and odd is not None and r.get(flag_key) == "keep":
                 vi = value_index(evk, kel)
                 if evk>=PICKS_MIN_EV and kel>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
                     picks.append({**base, "market":mk, "book":f"{mk}@{float(odd):.2f}",
@@ -653,7 +698,8 @@ def export_picks(rows_all: List[Dict], date_str: str):
                 ("home", r.get("ev_ah_home"), r.get("kelly_ah_home"), r.get("odds_ah_home")),
                 ("away", r.get("ev_ah_away"), r.get("kelly_ah_away"), r.get("odds_ah_away")),
             ]:
-                if evk is not None and kel is not None and odd is not None:
+                flag_key = f"flag_ev_ah_{side}"
+                if evk is not None and kel is not None and odd is not None and r.get(flag_key) == "keep":
                     vi = value_index(evk, kel)
                     if evk>=PICKS_MIN_EV and kel>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
                         picks.append({**base, "market":f"AH-{'Home' if side=='home' else 'Away'}",
@@ -661,13 +707,13 @@ def export_picks(rows_all: List[Dict], date_str: str):
                                       "ev":float(evk),"kelly":float(kel),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(kel)})
         # 角球 OU 主盘
         ev, k = r.get("ev_crn_main_over"), r.get("kelly_crn_main_over")
-        if ev is not None and k is not None:
+        if ev is not None and k is not None and r.get("flag_ev_crn_main_over") == "keep":
             vi = value_index(ev, k)
             if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
                 picks.append({**base,"market":"CRN-Over","book":_fmt_ou_book(r.get("crn_main_line"), r.get("odds_crn_main_over"), True),
                               "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)})
         ev, k = r.get("ev_crn_main_under"), r.get("kelly_crn_main_under")
-        if ev is not None and k is not None:
+        if ev is not None and k is not None and r.get("flag_ev_crn_main_under") == "keep":
             vi = value_index(ev, k)
             if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
                 picks.append({**base,"market":"CRN-Under","book":_fmt_ou_book(r.get("crn_main_line"), r.get("odds_crn_main_under"), True),
@@ -762,7 +808,7 @@ def build_ah_lines(odds: dict) -> dict:
         }
     return out
 
-def select_best_ah_main(ah_lines: dict, strict: int = 1) -> tuple[float, float, float] | None:
+def select_best_ah_main(ah_lines: dict, strict: int = 1) -> dict | None:
     """
     从 ah_lines 中挑“主盘”：优先低超盘、样本多、|line|小。
     返回 (line, home_odds, away_odds) 或 None
@@ -807,7 +853,16 @@ def select_best_ah_main(ah_lines: dict, strict: int = 1) -> tuple[float, float, 
 
     cands.sort()
     _, _, _, ln, oh, oa = cands[0]
-    return (float(ln), float(oh), float(oa))
+    info = ah_lines.get(str(float(ln))) or ah_lines.get(float(ln)) or {}
+    return {
+        "line": float(ln),
+        "home_odds": float(oh),
+        "away_odds": float(oa),
+        "home_cnt": int((info or {}).get("home_cnt", 0) or 0),
+        "away_cnt": int((info or {}).get("away_cnt", 0) or 0),
+        "overround": float((info or {}).get("overround", 0.0) or 0.0),
+        "update_age_min": (info or {}).get("update_age_min"),
+    }
 
 # ================== 主流程 ==================
 def main():
@@ -846,6 +901,7 @@ def main():
         try:
             league = fx["league"]; league_id = league["id"]; season = league["season"]
             league_name = league.get("name")
+            league_country = league.get("country")
             fixture_info = fx.get("fixture", {}); kickoff_utc = fixture_info.get("date"); fx_id = fixture_info.get("id")
             home = fx["teams"]["home"]; away = fx["teams"]["away"]
             home_id, away_id = home["id"], away["id"]
@@ -854,6 +910,7 @@ def main():
             print(f"跳过一场（解析失败）：{e}"); continue
 
         league_avg = compute_league_avg_from_cache(league_id, season)
+        league_tier = classify_league_tier(league_id, league_name, league_country)
 
         h_st = TEAM_STATS_CACHE.get((league_id, season, home_id), {}) or {}
         a_st = TEAM_STATS_CACHE.get((league_id, season, away_id), {}) or {}
@@ -879,8 +936,17 @@ def main():
 
         odds = odds_by_fixture(fx_id) if fx_id else {}
 
+        flag_map: Dict[str, str] = {}
+        flag_reason_map: Dict[str, str] = {}
+        vi_map: Dict[str, float | None] = {}
+
         # ===== 1X2 =====
         o1_h,o1_d,o1_a = odds.get("1x2_home"),odds.get("1x2_draw"),odds.get("1x2_away")
+        cnt_1x2_h = odds.get("1x2_home_cnt")
+        cnt_1x2_d = odds.get("1x2_draw_cnt")
+        cnt_1x2_a = odds.get("1x2_away_cnt")
+        overround_1x2 = odds.get("1x2_overround")
+        update_age_1x2 = odds.get("1x2_update_age_min")
         ev1_h=ev1_d=ev1_a=k1_h=k1_d=k1_a=None
         ok1 = sanitize_1x2(o1_h,o1_d,o1_a)
         if ok1:
@@ -890,6 +956,49 @@ def main():
             ev1_a,k1_a = ev_kelly_binary(sim["p_away"], o1_a)
             if is_ev_outlier(max([x for x in (ev1_h,ev1_d,ev1_a) if x is not None], default=0)):
                 ev1_h=ev1_d=ev1_a=k1_h=k1_d=k1_a=None
+
+        cnts_1x2 = [int(c) for c in (cnt_1x2_h, cnt_1x2_d, cnt_1x2_a) if isinstance(c, (int, float)) and c > 0]
+        min_cnt_1x2 = min(cnts_1x2) if cnts_1x2 else None
+
+        ev1_h, k1_h = apply_ev_filter(
+            "ev_1x2_home",
+            ev1_h,
+            k1_h,
+            "1x2",
+            league_tier,
+            min_bookmakers=min_cnt_1x2,
+            overround=overround_1x2,
+            update_age=update_age_1x2,
+            flag_map=flag_map,
+            reason_map=flag_reason_map,
+            vi_map=vi_map,
+        )
+        ev1_d, k1_d = apply_ev_filter(
+            "ev_1x2_draw",
+            ev1_d,
+            k1_d,
+            "1x2",
+            league_tier,
+            min_bookmakers=min_cnt_1x2,
+            overround=overround_1x2,
+            update_age=update_age_1x2,
+            flag_map=flag_map,
+            reason_map=flag_reason_map,
+            vi_map=vi_map,
+        )
+        ev1_a, k1_a = apply_ev_filter(
+            "ev_1x2_away",
+            ev1_a,
+            k1_a,
+            "1x2",
+            league_tier,
+            min_bookmakers=min_cnt_1x2,
+            overround=overround_1x2,
+            update_age=update_age_1x2,
+            flag_map=flag_map,
+            reason_map=flag_reason_map,
+            vi_map=vi_map,
+        )
 
         # ===== Goals OU 主盘 =====
         ou_main_line   = odds.get("ou_main_line")
@@ -910,10 +1019,42 @@ def main():
                 if is_ev_outlier(max([x for x in (ev_main_over, ev_main_under) if x is not None], default=0)):
                     ev_main_over = ev_main_under = k_main_over = k_main_under = None
 
+        cnts_ou_main = [int(c) for c in (ou_cnt_o, ou_cnt_u) if isinstance(c, (int, float)) and c > 0]
+        min_cnt_ou_main = min(cnts_ou_main) if cnts_ou_main else None
+        update_age_ou_main = odds.get("ou_main_update_age_min")
+
+        ev_main_over, k_main_over = apply_ev_filter(
+            "ev_ou_main_over",
+            ev_main_over,
+            k_main_over,
+            "ou",
+            league_tier,
+            min_bookmakers=min_cnt_ou_main,
+            overround=ou_overround,
+            update_age=update_age_ou_main,
+            flag_map=flag_map,
+            reason_map=flag_reason_map,
+            vi_map=vi_map,
+        )
+        ev_main_under, k_main_under = apply_ev_filter(
+            "ev_ou_main_under",
+            ev_main_under,
+            k_main_under,
+            "ou",
+            league_tier,
+            min_bookmakers=min_cnt_ou_main,
+            overround=ou_overround,
+            update_age=update_age_ou_main,
+            flag_map=flag_map,
+            reason_map=flag_reason_map,
+            vi_map=vi_map,
+        )
+
         # ===== OU@2.5 参考 =====
         o25_over,o25_under = odds.get("ou_over_2_5"),odds.get("ou_under_2_5")
         ev25_over=ev25_under=k25_over=k25_under=None
         ok25 = sanitize_ou_pair(o25_over,o25_under)
+        overround_ou25 = None
         if ok25:
             o25_over,o25_under = ok25
             res25 = ou_ev_kelly_from_totals_quarter(2.5, float(o25_over), float(o25_under), totals)
@@ -921,16 +1062,59 @@ def main():
             ev25_under, k25_under = res25["EV_under"], res25["Kelly_under"]
             if is_ev_outlier(max([x for x in (ev25_over,ev25_under) if x is not None], default=0)):
                 ev25_over=ev25_under=k25_over=k25_under=None
+            else:
+                try:
+                    overround_ou25 = float(1.0/float(o25_over) + 1.0/float(o25_under))
+                except Exception:
+                    overround_ou25 = None
+
+        min_cnt_ou_25 = min_cnt_ou_main
+        ev25_over, k25_over = apply_ev_filter(
+            "ev_ou_over2.5",
+            ev25_over,
+            k25_over,
+            "ou",
+            league_tier,
+            min_bookmakers=min_cnt_ou_25,
+            overround=overround_ou25 if overround_ou25 is not None else ou_overround,
+            update_age=update_age_ou_main,
+            flag_map=flag_map,
+            reason_map=flag_reason_map,
+            vi_map=vi_map,
+        )
+        ev25_under, k25_under = apply_ev_filter(
+            "ev_ou_under2.5",
+            ev25_under,
+            k25_under,
+            "ou",
+            league_tier,
+            min_bookmakers=min_cnt_ou_25,
+            overround=ou_overround,
+            update_age=update_age_ou_main,
+            flag_map=flag_map,
+            reason_map=flag_reason_map,
+            vi_map=vi_map,
+        )
 
         # ===== AH 全线（统一归一）
         ah_lines = build_ah_lines(odds)
 
         # ===== AH 主盘（缺就从全线里自选）
         ah_line, ah_oh, ah_oa = odds.get("ah_line"), odds.get("ah_home_odds"), odds.get("ah_away_odds")
+        ah_cnt_h = odds.get("ah_home_cnt") or 0
+        ah_cnt_a = odds.get("ah_away_cnt") or 0
+        ah_overround = odds.get("ah_overround")
+        ah_update_age = odds.get("ah_main_update_age_min")
         if ah_line is None or ah_oh is None or ah_oa is None:
             pick = select_best_ah_main(ah_lines, strict=STRICT_AH_MAIN)
             if pick:
-                ah_line, ah_oh, ah_oa = pick
+                ah_line = pick.get("line")
+                ah_oh = pick.get("home_odds")
+                ah_oa = pick.get("away_odds")
+                ah_cnt_h = pick.get("home_cnt", ah_cnt_h)
+                ah_cnt_a = pick.get("away_cnt", ah_cnt_a)
+                ah_overround = pick.get("overround", ah_overround)
+                ah_update_age = pick.get("update_age_min", ah_update_age)
 
         ev_ah_h = ev_ah_a = k_ah_h = k_ah_a = None
         if ah_line is not None and ah_oh is not None and ah_oa is not None:
@@ -943,9 +1127,40 @@ def main():
                 ev_ah_a, k_ah_a = evk["away"].get("EV"), evk["away"].get("Kelly")
             if is_ev_outlier(max([x for x in (ev_ah_h, ev_ah_a) if x is not None], default=0)):
                 ev_ah_h = ev_ah_a = k_ah_h = k_ah_a = None
-            else:
-                if ev_ah_h is not None: cnt_ah_ev_home += 1
-                if ev_ah_a is not None: cnt_ah_ev_away += 1
+
+        cnts_ah = [int(c) for c in (ah_cnt_h, ah_cnt_a) if isinstance(c, (int, float)) and c > 0]
+        min_cnt_ah = min(cnts_ah) if cnts_ah else None
+        ev_ah_h, k_ah_h = apply_ev_filter(
+            "ev_ah_home",
+            ev_ah_h,
+            k_ah_h,
+            "ah",
+            league_tier,
+            min_bookmakers=min_cnt_ah,
+            overround=ah_overround,
+            update_age=ah_update_age,
+            flag_map=flag_map,
+            reason_map=flag_reason_map,
+            vi_map=vi_map,
+        )
+        ev_ah_a, k_ah_a = apply_ev_filter(
+            "ev_ah_away",
+            ev_ah_a,
+            k_ah_a,
+            "ah",
+            league_tier,
+            min_bookmakers=min_cnt_ah,
+            overround=ah_overround,
+            update_age=ah_update_age,
+            flag_map=flag_map,
+            reason_map=flag_reason_map,
+            vi_map=vi_map,
+        )
+
+        if flag_map.get("ev_ah_home") in ("keep", "review"):
+            cnt_ah_ev_home += 1
+        if flag_map.get("ev_ah_away") in ("keep", "review"):
+            cnt_ah_ev_away += 1
 
         # ===== 角球 OU 主盘 =====
         crn_main_line  = odds.get("crn_main_line")
@@ -970,6 +1185,37 @@ def main():
                 ev_crn_under, k_crn_under = resC["EV_under"], resC["Kelly_under"]
                 if is_ev_outlier(max([x for x in (ev_crn_over,ev_crn_under) if x is not None], default=0)):
                     ev_crn_over = ev_crn_under = k_crn_over = k_crn_under = None
+
+        cnts_crn = [int(c) for c in (crn_cnt_o, crn_cnt_u) if isinstance(c, (int, float)) and c > 0]
+        min_cnt_crn = min(cnts_crn) if cnts_crn else None
+        update_age_crn = odds.get("crn_main_update_age_min")
+
+        ev_crn_over, k_crn_over = apply_ev_filter(
+            "ev_crn_main_over",
+            ev_crn_over,
+            k_crn_over,
+            "derivative",
+            league_tier,
+            min_bookmakers=min_cnt_crn,
+            overround=crn_overround,
+            update_age=update_age_crn,
+            flag_map=flag_map,
+            reason_map=flag_reason_map,
+            vi_map=vi_map,
+        )
+        ev_crn_under, k_crn_under = apply_ev_filter(
+            "ev_crn_main_under",
+            ev_crn_under,
+            k_crn_under,
+            "derivative",
+            league_tier,
+            min_bookmakers=min_cnt_crn,
+            overround=crn_overround,
+            update_age=update_age_crn,
+            flag_map=flag_map,
+            reason_map=flag_reason_map,
+            vi_map=vi_map,
+        )
 
         # ===== 全线榜单池 & 盘口矩阵（优先使用 *_lines；无则回退 _raw_*） =====
         ou_lines = odds.get("ou_lines") or {}
@@ -1086,17 +1332,25 @@ def main():
 
         # ===== 综合最佳 =====
         cands = []
-        for label,ev,k in [
-            ("1X2-Home", ev1_h, k1_h), ("1X2-Draw", ev1_d, k1_d), ("1X2-Away", ev1_a, k1_a),
-            ("OU(main)-Over", ev_main_over, k_main_over), ("OU(main)-Under", ev_main_under, k_main_under),
-            ("OU2.5-Over", ev25_over, k25_over), ("OU2.5-Under", ev25_under, k25_under),
-            (f"AH({ah_line:+})-Home" if ah_line is not None else None, ev_ah_h, k_ah_h),
-            (f"AH({ah_line:+})-Away" if ah_line is not None else None, ev_ah_a, k_ah_a),
-            (f"CRN({crn_main_line})-Over" if crn_main_line is not None else None, ev_crn_over, k_crn_over),
-            (f"CRN({crn_main_line})-Under" if crn_main_line is not None else None, ev_crn_under, k_crn_under),
-        ]:
-            if label and ev is not None and k is not None:
-                cands.append((value_index(ev,k), label, ev, k))
+        candidate_specs = [
+            ("1X2-Home", "ev_1x2_home", ev1_h, k1_h),
+            ("1X2-Draw", "ev_1x2_draw", ev1_d, k1_d),
+            ("1X2-Away", "ev_1x2_away", ev1_a, k1_a),
+            ("OU(main)-Over", "ev_ou_main_over", ev_main_over, k_main_over),
+            ("OU(main)-Under", "ev_ou_main_under", ev_main_under, k_main_under),
+            ("OU2.5-Over", "ev_ou_over2.5", ev25_over, k25_over),
+            ("OU2.5-Under", "ev_ou_under2.5", ev25_under, k25_under),
+            (f"AH({ah_line:+})-Home" if ah_line is not None else None, "ev_ah_home", ev_ah_h, k_ah_h),
+            (f"AH({ah_line:+})-Away" if ah_line is not None else None, "ev_ah_away", ev_ah_a, k_ah_a),
+            (f"CRN({crn_main_line})-Over" if crn_main_line is not None else None, "ev_crn_main_over", ev_crn_over, k_crn_over),
+            (f"CRN({crn_main_line})-Under" if crn_main_line is not None else None, "ev_crn_main_under", ev_crn_under, k_crn_under),
+        ]
+        for label, key, ev, k in candidate_specs:
+            if not label or ev is None or k is None:
+                continue
+            if flag_map.get(key) not in ("keep", "review"):
+                continue
+            cands.append((value_index(ev,k), label, ev, k))
         cands.sort(key=lambda x: x[0], reverse=True)
         best_label = cands[0][1] if cands else None
         best_ev    = cands[0][2] if cands else None
@@ -1111,6 +1365,7 @@ def main():
 
         row = {
             "date_utc": date_str, "kickoff_utc": kickoff_utc, "league": league_name,
+            "league_tier": league_tier,
             "home": home_name, "away": away_name,
             "lam_home": round(lam_home,3), "lam_away": round(lam_away,3),
             "p_home": round(sim["p_home"],4), "p_draw": round(sim["p_draw"],4), "p_away": round(sim["p_away"],4),
@@ -1148,6 +1403,11 @@ def main():
             "best_market": best_label, "best_ev": best_ev, "best_kelly": best_kelly,
             "value_index": value_index(best_ev, best_kelly) if (best_ev is not None and best_kelly is not None) else None
         }
+
+        for key, tag in flag_map.items():
+            row[f"flag_{key}"] = tag
+        for key, reason in flag_reason_map.items():
+            row[f"flag_reason_{key}"] = reason
 
         if lam_detail:
             row["lam_blend_detail"] = lam_detail
@@ -1205,12 +1465,15 @@ def main():
         for r in rows:
             ev,k = r.get(key_ev), r.get(key_k)
             if ev is None or k is None or ev < MIN_EV: continue
-            items.append((value_index(ev,k), r, ev, k))
+            flag = r.get(f"flag_{key_ev}")
+            if flag not in ("keep", "review"): continue
+            items.append((value_index(ev,k), r, ev, k, flag))
         items.sort(key=lambda x: x[0], reverse=True)
         print(f"\n=== Top {min(TOP_K, len(items))}（{label}，EV≥{MIN_EV:.2f}） ===")
-        for i,(_,r,ev,k) in enumerate(items[:TOP_K], 1):
+        for i,(_,r,ev,k,flag) in enumerate(items[:TOP_K], 1):
             extra = suffix_fn(r) if suffix_fn else ""
-            print(f"[{i:02d}] {r['home']} vs {r['away']} | EV={ev:.3f} Kelly≈{k:.3f} | {label}{(' ' + extra) if extra else ''}")
+            tag = " [Review]" if flag == "review" else ""
+            print(f"[{i:02d}] {r['home']} vs {r['away']} | EV={ev:.3f} Kelly≈{k:.3f} | {label}{(' ' + extra) if extra else ''}{tag}")
 
     # Suffix 生成（去掉多余空格）
     suf_ou_over  = lambda r: _fmt_ou_book(r.get("ou_main_line"), r.get("odds_ou_main_over"), False)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os, json, time, hashlib, threading
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import requests
 from requests.adapters import HTTPAdapter
@@ -46,6 +47,51 @@ _MEMO: Dict[str, tuple[float, dict]] = {}
 def _memo_key(endpoint: str, params: dict) -> str:
     s = json.dumps({"e": endpoint, "p": params}, sort_keys=True, separators=(",", ":"))
     return hashlib.md5(s.encode("utf-8")).hexdigest()
+
+
+def _parse_update_ts(value) -> float | None:
+    """Best-effort parser for bookmaker odds update timestamps."""
+
+    if value in (None, ""):
+        return None
+
+    try:
+        if isinstance(value, (int, float)):
+            ts = float(value)
+            if ts > 1e12:  # millisecond timestamps
+                ts /= 1000.0
+            return ts if ts > 0 else None
+
+        if isinstance(value, str):
+            txt = value.strip()
+            if not txt:
+                return None
+            if txt.isdigit():
+                ts = float(txt)
+                if ts > 1e12:
+                    ts /= 1000.0
+                return ts if ts > 0 else None
+            try:
+                iso_txt = txt
+                if iso_txt.endswith("Z"):
+                    iso_txt = iso_txt[:-1] + "+00:00"
+                dt = datetime.fromisoformat(iso_txt)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            except ValueError:
+                pass
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                try:
+                    dt = datetime.strptime(txt, fmt)
+                    dt = dt.replace(tzinfo=timezone.utc)
+                    return dt.timestamp()
+                except ValueError:
+                    continue
+    except Exception:
+        return None
+
+    return None
 
 def _get(endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
     global _last_call_ts
@@ -123,6 +169,8 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
     except Exception:
         return {}
 
+    now_ts = time.time()
+
     def is_goal_ou(name: str) -> bool:
         n = (name or "").lower()
         # 常见命名 + Asian Total Goals / Goal Line
@@ -166,15 +214,18 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
         except Exception:
             return None
 
-    def _add_safe(lst, odd):
+    def _add_safe(lst, odd, updates=None, update_ts=None):
         try:
             v = float(odd)
             if 1.10 <= v <= 50.0:
                 lst.append(v)
+                if updates is not None and update_ts is not None:
+                    updates.append(update_ts)
         except Exception:
             pass
 
     h_list, d_list, a_list = [], [], []
+    updates_1x2: List[float] = []
     ou_map: Dict[float, Dict[str, List[float]]] = {}
     ah_map: Dict[float, Dict[str, List[float]]] = {}   # home_line -> {"home": [], "away": []}
     cr_map: Dict[float, Dict[str, List[float]]] = {}
@@ -182,18 +233,24 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
     # —— 解析各博彩公司盘口 —— #
     for item in data.get("response", []):
         for bk in item.get("bookmakers") or []:
+            bk_update = _parse_update_ts(bk.get("last_update") or bk.get("update"))
             for b in bk.get("bets") or []:
                 name = b.get("name") or ""
                 values = b.get("values") or []
+                bet_update = _parse_update_ts(b.get("last_update") or b.get("update")) or bk_update
 
                 # 1X2
                 if "match winner" in name.lower() or name.lower() in ("1x2","match odds","winner"):
                     for v in values:
                         val = (v.get("value") or "").lower().strip()
                         odd = v.get("odd")
-                        if val in ("home","1"): _add_safe(h_list, odd)
-                        elif val in ("draw","x"): _add_safe(d_list, odd)
-                        elif val in ("away","2"): _add_safe(a_list, odd)
+                        update_ts = _parse_update_ts(v.get("last_update") or v.get("update")) or bet_update
+                        if val in ("home","1"):
+                            _add_safe(h_list, odd, updates_1x2, update_ts)
+                        elif val in ("draw","x"):
+                            _add_safe(d_list, odd, updates_1x2, update_ts)
+                        elif val in ("away","2"):
+                            _add_safe(a_list, odd, updates_1x2, update_ts)
 
                 # 进球 OU（含 Asian Total / Goal Line）
                 if is_goal_ou(name):
@@ -207,10 +264,19 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                             elif s.startswith("under"): line = _parse_float(s[5:])
                         if line is None:
                             continue
+                        odd_val = _parse_float(odd)
+                        if odd_val is None or not (1.10 <= odd_val <= 50.0):
+                            continue
+                        update_ts = _parse_update_ts(v.get("last_update") or v.get("update")) or bet_update
+                        entry = ou_map.setdefault(float(line), {"over": [], "under": [], "updates": []})
                         if side_txt.startswith("over"):
-                            ou_map.setdefault(float(line), {"over": [], "under": []})["over"].append(_parse_float(odd) or 0.0)
+                            entry["over"].append(odd_val)
                         elif side_txt.startswith("under"):
-                            ou_map.setdefault(float(line), {"over": [], "under": []})["under"].append(_parse_float(odd) or 0.0)
+                            entry["under"].append(odd_val)
+                        else:
+                            continue
+                        if update_ts is not None:
+                            entry["updates"].append(update_ts)
 
                 # 角球 OU
                 if is_corners_ou(name):
@@ -224,10 +290,19 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                             elif s.startswith("under"): line = _parse_float(s[5:])
                         if line is None:
                             continue
+                        odd_val = _parse_float(odd)
+                        if odd_val is None or not (1.10 <= odd_val <= 50.0):
+                            continue
+                        update_ts = _parse_update_ts(v.get("last_update") or v.get("update")) or bet_update
+                        entry = cr_map.setdefault(float(line), {"over": [], "under": [], "updates": []})
                         if side_txt.startswith("over"):
-                            cr_map.setdefault(float(line), {"over": [], "under": []})["over"].append(_parse_float(odd) or 0.0)
+                            entry["over"].append(odd_val)
                         elif side_txt.startswith("under"):
-                            cr_map.setdefault(float(line), {"over": [], "under": []})["under"].append(_parse_float(odd) or 0.0)
+                            entry["under"].append(odd_val)
+                        else:
+                            continue
+                        if update_ts is not None:
+                            entry["updates"].append(update_ts)
 
                 # 亚洲让球（非角球）
                 if is_asian_handicap(name):
@@ -252,8 +327,11 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                         if resolved_line is None:
                             resolved_line = line_val if side_txt == "home" else -line_val
 
-                        ah_map.setdefault(resolved_line, {"home": [], "away": []})
-                        ah_map[resolved_line][side_txt].append(odd)
+                        update_ts = _parse_update_ts(v.get("last_update") or v.get("update")) or bet_update
+                        entry = ah_map.setdefault(resolved_line, {"home": [], "away": [], "updates": []})
+                        entry[side_txt].append(odd)
+                        if update_ts is not None:
+                            entry["updates"].append(update_ts)
 
     out: Dict[str, float] = {}
 
@@ -261,8 +339,16 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
     mh, md, ma = _median(h_list), _median(d_list), _median(a_list)
     if mh and md and ma:
         imp_sum = 1.0/mh + 1.0/md + 1.0/ma
-        if 1.02 <= imp_sum <= 1.30 and min(len(h_list),len(d_list),len(a_list)) >= 2:
+        cnt_h, cnt_d, cnt_a = len(h_list), len(d_list), len(a_list)
+        if 1.02 <= imp_sum <= 1.30 and min(cnt_h, cnt_d, cnt_a) >= 2:
             out["1x2_home"], out["1x2_draw"], out["1x2_away"] = mh, md, ma
+            out["1x2_home_cnt"], out["1x2_draw_cnt"], out["1x2_away_cnt"] = int(cnt_h), int(cnt_d), int(cnt_a)
+            out["1x2_overround"] = float(imp_sum)
+            updates = [u for u in updates_1x2 if u]
+            if updates:
+                latest = max(updates)
+                out["1x2_last_update_ts"] = latest
+                out["1x2_update_age_min"] = float((now_ts - latest) / 60.0)
 
     # —— Goals OU 主盘
     main = None
@@ -284,6 +370,11 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
         out["ou_main_line"] = float(line)
         out["ou_main_over"], out["ou_main_under"] = float(om), float(um)
         out["ou_main_over_cnt"], out["ou_main_under_cnt"], out["ou_main_overround"] = int(co), int(cu), float(oround)
+        updates = [u for u in ou_map.get(line, {}).get("updates", []) if u]
+        if updates:
+            latest = max(updates)
+            out["ou_main_last_update_ts"] = latest
+            out["ou_main_update_age_min"] = float((now_ts - latest) / 60.0)
 
     # —— Goals OU@2.5 参考
     if 2.5 in ou_map:
@@ -313,6 +404,13 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
         _,_,line,oh,oa,ch,ca,oround = pick
         out["ah_line"], out["ah_home_odds"], out["ah_away_odds"] = float(line), float(oh), float(oa)
         out["ah_home_cnt"], out["ah_away_cnt"], out["ah_overround"] = int(ch), int(ca), float(oround)
+        updates = [u for u in ah_map.get(line, {}).get("updates", []) if u]
+        if not updates and -line in ah_map:
+            updates = [u for u in ah_map.get(-line, {}).get("updates", []) if u]
+        if updates:
+            latest = max(updates)
+            out["ah_main_last_update_ts"] = latest
+            out["ah_main_update_age_min"] = float((now_ts - latest) / 60.0)
 
     # —— 角球 OU 主盘
     cmain = None
@@ -333,6 +431,11 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
         out["crn_main_line"] = float(line)
         out["crn_main_over"], out["crn_main_under"] = float(om), float(um)
         out["crn_main_over_cnt"], out["crn_main_under_cnt"], out["crn_main_overround"] = int(co), int(cu), float(oround)
+        updates = [u for u in cr_map.get(line, {}).get("updates", []) if u]
+        if updates:
+            latest = max(updates)
+            out["crn_main_last_update_ts"] = latest
+            out["crn_main_update_age_min"] = float((now_ts - latest) / 60.0)
 
     # —— 全线快照（用于“全线 Top 10”打印） —— #
     ou_all_list = []
@@ -373,7 +476,11 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                 continue
             over = [float(x) for x in sides.get("over", []) if x]
             under = [float(x) for x in sides.get("under", []) if x]
-            outm[key] = {"over": over, "under": under}
+            entry = {"over": over, "under": under}
+            updates = [float(x) for x in sides.get("updates", []) if x]
+            if updates:
+                entry["updates"] = updates
+            outm[key] = entry
         return outm
 
     def _clean_ah_map(m):
@@ -385,7 +492,11 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                 continue
             home = [float(x) for x in sides.get("home", []) if x]
             away = [float(x) for x in sides.get("away", []) if x]
-            outm[key] = {"home": home, "away": away}
+            entry = {"home": home, "away": away}
+            updates = [float(x) for x in sides.get("updates", []) if x]
+            if updates:
+                entry["updates"] = updates
+            outm[key] = entry
         return outm
 
     out["_raw_ou_map"]  = _clean_ou_or_cr_map(ou_map)
@@ -404,13 +515,18 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
             if not om or not um:
                 continue
             overround = 1.0/om + 1.0/um
-            res[str(float(line))] = {
+            entry = {
                 "over_median": float(om),
                 "under_median": float(um),
                 "over_cnt": int(len(ov)),
                 "under_cnt": int(len(un)),
                 "overround": float(overround),
             }
+            updates = [float(x) for x in sides.get("updates", []) if x]
+            if updates:
+                latest = max(updates)
+                entry["update_age_min"] = float((now_ts - latest) / 60.0)
+            res[str(float(line))] = entry
         return res
 
     def pack_ah_lines(src: Dict[float, Dict[str, List[float]]]) -> Dict[str, Dict[str, float]]:
@@ -424,13 +540,18 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
             if not oh or not oa:
                 continue
             overround = 1.0/oh + 1.0/oa
-            res[str(float(line))] = {
+            entry = {
                 "home_median": float(oh),
                 "away_median": float(oa),
                 "home_cnt": int(len(hs)),
                 "away_cnt": int(len(as_)),
                 "overround": float(overround),
             }
+            updates = [float(x) for x in sides.get("updates", []) if x]
+            if updates:
+                latest = max(updates)
+                entry["update_age_min"] = float((now_ts - latest) / 60.0)
+            res[str(float(line))] = entry
         return res
 
     out["ou_lines"]  = pack_ou_lines(out["_raw_ou_map"])
