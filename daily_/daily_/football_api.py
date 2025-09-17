@@ -146,6 +146,17 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
     def is_asian_handicap(name: str) -> bool:
         n = (name or "").lower()
         if "asian handicap" in n or ("handicap" in n and "european" not in n):
+            forbid = [
+                "1st half",
+                "first half",
+                "2nd half",
+                "second half",
+                "half time",
+                "half-time",
+                "halftime",
+            ]
+            if any(term in n for term in forbid):
+                return False
             return "corner" not in n and "cards" not in n and "booking" not in n
         return False
 
