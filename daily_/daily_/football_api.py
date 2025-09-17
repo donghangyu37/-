@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Dict, List
 
+import time
+
 _SRC_PATH = Path(__file__).resolve().parents[2] / "src" / "api" / "football_api.py"
 _SPEC = importlib.util.spec_from_file_location("src.api.football_api", _SRC_PATH)
 _MODULE = importlib.util.module_from_spec(_SPEC)
@@ -44,12 +46,17 @@ def _clean_ah_map(ah_map: Dict[float, Dict[str, List[float]]]) -> Dict[float, Di
             continue
         home = [float(x) for x in sides.get("home", []) if x]
         away = [float(x) for x in sides.get("away", []) if x]
-        cleaned[key] = {"home": home, "away": away}
+        entry = {"home": home, "away": away}
+        updates = [float(x) for x in sides.get("updates", []) if x]
+        if updates:
+            entry["updates"] = updates
+        cleaned[key] = entry
     return cleaned
 
 
 def _pack_ah_lines(raw: Dict[float, Dict[str, List[float]]]) -> Dict[str, Dict[str, float]]:
     summary: Dict[str, Dict[str, float]] = {}
+    now_ts = time.time()
     for line, sides in raw.items():
         home = [x for x in sides.get("home", []) if x]
         away = [x for x in sides.get("away", []) if x]
@@ -60,13 +67,18 @@ def _pack_ah_lines(raw: Dict[float, Dict[str, List[float]]]) -> Dict[str, Dict[s
         if oh is None or oa is None:
             continue
         overround = 1.0 / oh + 1.0 / oa
-        summary[str(float(line))] = {
+        entry = {
             "home_median": float(oh),
             "away_median": float(oa),
             "home_cnt": int(len(home)),
             "away_cnt": int(len(away)),
             "overround": float(overround),
         }
+        updates = [float(x) for x in sides.get("updates", []) if x]
+        if updates:
+            latest = max(updates)
+            entry["update_age_min"] = float((now_ts - latest) / 60.0)
+        summary[str(float(line))] = entry
     return summary
 
 
