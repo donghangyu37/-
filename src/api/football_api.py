@@ -1,7 +1,9 @@
 # === src/api/football_api.py · 并发复用 + 退避重试 + 限速 + 轻量缓存 + 主盘/全线聚合（含角球/Asian Totals） ===
 from __future__ import annotations
 
-import os, json, time, hashlib, threading
+import os, json, time, hashlib, threading, re
+from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import requests
 from requests.adapters import HTTPAdapter
@@ -111,11 +113,114 @@ def find_league(country: str, league_name: str, season: int) -> Optional[int]:
         return data["response"][0]["league"]["id"]
     return None
 
+_SIDE_TOKENS = {
+    "home": "home",
+    "1": "home",
+    "team1": "home",
+    "h": "home",
+    "away": "away",
+    "2": "away",
+    "team2": "away",
+    "a": "away",
+    "guest": "away",
+    "visitor": "away",
+}
+
+_PICK_TOKENS = {"pk", "pick", "pick'em", "pickem", "p.k.", "p.k"}
+_NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
+
+
+def _parse_update_timestamp(value) -> float | None:
+    """Parse bookmaker update timestamps into epoch seconds."""
+
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    # Normalise common ISO8601 variations returned by the API.
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    return dt.timestamp()
+
+
 def _median(arr):
     arr = [x for x in (arr or []) if x]
-    if not arr: return None
-    arr = sorted(arr); n = len(arr)
+    if not arr:
+        return None
+    arr = sorted(arr)
+    n = len(arr)
     return float(arr[n // 2]) if n % 2 == 1 else float((arr[n // 2 - 1] + arr[n // 2]) / 2)
+
+
+def _parse_float(value, default=None):
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    text = str(value).strip()
+    if not text:
+        return default
+    text_norm = text.lower().replace("−", "-")
+    if text_norm in _PICK_TOKENS:
+        return 0.0
+
+    try:
+        return float(text_norm.replace(",", "."))
+    except ValueError:
+        match = _NUM_RE.search(text_norm)
+        if match:
+            token = match.group(0).replace(",", ".")
+            try:
+                return float(token)
+            except ValueError:
+                return default
+    return default
+
+
+def _normalise_side(value) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    text = text.replace("home team", "home").replace("away team", "away")
+    if "home" in text:
+        return "home"
+    if "away" in text or "visitor" in text or "guest" in text:
+        return "away"
+
+    tokens = [tok for tok in re.split(r"[^a-z0-9]+", text) if tok]
+    for token in tokens:
+        if token in _SIDE_TOKENS:
+            return _SIDE_TOKENS[token]
+    return None
+
+
+def _extract_handicap(entry: Dict[str, Any]) -> float | None:
+    line = _parse_float(entry.get("handicap"))
+    if line is not None:
+        return line
+    return _parse_float(entry.get("value"))
 
 def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
     try:
@@ -179,24 +284,45 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
     ah_map: Dict[float, Dict[str, List[float]]] = {}   # home_line -> {"home": [], "away": []}
     cr_map: Dict[float, Dict[str, List[float]]] = {}
 
+    ou_updates: dict[float, List[float]] = defaultdict(list)
+    ah_updates: dict[float, List[float]] = defaultdict(list)
+    cr_updates: dict[float, List[float]] = defaultdict(list)
+    one_x_two_updates: List[float] = []
+
     # —— 解析各博彩公司盘口 —— #
     for item in data.get("response", []):
         for bk in item.get("bookmakers") or []:
+            update_ts = _parse_update_timestamp(
+                bk.get("last_update")
+                or bk.get("lastUpdate")
+                or bk.get("update")
+            )
+
             for b in bk.get("bets") or []:
                 name = b.get("name") or ""
                 values = b.get("values") or []
 
                 # 1X2
                 if "match winner" in name.lower() or name.lower() in ("1x2","match odds","winner"):
+                    used_market = False
                     for v in values:
                         val = (v.get("value") or "").lower().strip()
                         odd = v.get("odd")
-                        if val in ("home","1"): _add_safe(h_list, odd)
-                        elif val in ("draw","x"): _add_safe(d_list, odd)
-                        elif val in ("away","2"): _add_safe(a_list, odd)
+                        if val in ("home","1"):
+                            _add_safe(h_list, odd)
+                            used_market = True
+                        elif val in ("draw","x"):
+                            _add_safe(d_list, odd)
+                            used_market = True
+                        elif val in ("away","2"):
+                            _add_safe(a_list, odd)
+                            used_market = True
+                    if used_market and update_ts is not None:
+                        one_x_two_updates.append(update_ts)
 
                 # 进球 OU（含 Asian Total / Goal Line）
                 if is_goal_ou(name):
+                    lines_used: set[float] = set()
                     for v in values:
                         side_txt = (v.get("value") or "").lower().strip()
                         odd = v.get("odd")
@@ -207,13 +333,20 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                             elif s.startswith("under"): line = _parse_float(s[5:])
                         if line is None:
                             continue
+                        line_f = float(line)
                         if side_txt.startswith("over"):
-                            ou_map.setdefault(float(line), {"over": [], "under": []})["over"].append(_parse_float(odd) or 0.0)
+                            ou_map.setdefault(line_f, {"over": [], "under": []})["over"].append(_parse_float(odd) or 0.0)
+                            lines_used.add(line_f)
                         elif side_txt.startswith("under"):
-                            ou_map.setdefault(float(line), {"over": [], "under": []})["under"].append(_parse_float(odd) or 0.0)
+                            ou_map.setdefault(line_f, {"over": [], "under": []})["under"].append(_parse_float(odd) or 0.0)
+                            lines_used.add(line_f)
+                    if update_ts is not None:
+                        for ln in lines_used:
+                            ou_updates[ln].append(update_ts)
 
                 # 角球 OU
                 if is_corners_ou(name):
+                    lines_used: set[float] = set()
                     for v in values:
                         side_txt = (v.get("value") or "").lower().strip()
                         odd = v.get("odd")
@@ -224,18 +357,25 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                             elif s.startswith("under"): line = _parse_float(s[5:])
                         if line is None:
                             continue
+                        line_f = float(line)
                         if side_txt.startswith("over"):
-                            cr_map.setdefault(float(line), {"over": [], "under": []})["over"].append(_parse_float(odd) or 0.0)
+                            cr_map.setdefault(line_f, {"over": [], "under": []})["over"].append(_parse_float(odd) or 0.0)
+                            lines_used.add(line_f)
                         elif side_txt.startswith("under"):
-                            cr_map.setdefault(float(line), {"over": [], "under": []})["under"].append(_parse_float(odd) or 0.0)
+                            cr_map.setdefault(line_f, {"over": [], "under": []})["under"].append(_parse_float(odd) or 0.0)
+                            lines_used.add(line_f)
+                    if update_ts is not None:
+                        for ln in lines_used:
+                            cr_updates[ln].append(update_ts)
 
                 # 亚洲让球（非角球）
                 if is_asian_handicap(name):
+                    lines_used: set[float] = set()
                     for v in values:
-                        side_txt = (v.get("value") or "").lower().strip()   # "Home"/"Away"
+                        side_txt = _normalise_side(v.get("value"))
                         odd = _parse_float(v.get("odd"))
-                        line = _parse_float(v.get("handicap"))
-                        if side_txt not in ("home","away") or line is None or odd is None:
+                        line = _extract_handicap(v)
+                        if side_txt not in ("home", "away") or line is None or odd is None:
                             continue
                         if not (1.10 <= odd <= 50.0):
                             continue
@@ -254,6 +394,10 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
 
                         ah_map.setdefault(resolved_line, {"home": [], "away": []})
                         ah_map[resolved_line][side_txt].append(odd)
+                        lines_used.add(resolved_line)
+                    if update_ts is not None:
+                        for ln in lines_used:
+                            ah_updates[ln].append(update_ts)
 
     out: Dict[str, float] = {}
 
@@ -263,6 +407,10 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
         imp_sum = 1.0/mh + 1.0/md + 1.0/ma
         if 1.02 <= imp_sum <= 1.30 and min(len(h_list),len(d_list),len(a_list)) >= 2:
             out["1x2_home"], out["1x2_draw"], out["1x2_away"] = mh, md, ma
+            out["1x2_overround"] = float(imp_sum)
+            out["1x2_home_cnt"], out["1x2_draw_cnt"], out["1x2_away_cnt"] = int(len(h_list)), int(len(d_list)), int(len(a_list))
+            if one_x_two_updates:
+                out["1x2_last_update_ts"] = max(one_x_two_updates)
 
     # —— Goals OU 主盘
     main = None
@@ -284,6 +432,9 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
         out["ou_main_line"] = float(line)
         out["ou_main_over"], out["ou_main_under"] = float(om), float(um)
         out["ou_main_over_cnt"], out["ou_main_under_cnt"], out["ou_main_overround"] = int(co), int(cu), float(oround)
+        ts_list = ou_updates.get(float(line))
+        if ts_list:
+            out["ou_main_last_update_ts"] = max(ts_list)
 
     # —— Goals OU@2.5 参考
     if 2.5 in ou_map:
@@ -313,6 +464,9 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
         _,_,line,oh,oa,ch,ca,oround = pick
         out["ah_line"], out["ah_home_odds"], out["ah_away_odds"] = float(line), float(oh), float(oa)
         out["ah_home_cnt"], out["ah_away_cnt"], out["ah_overround"] = int(ch), int(ca), float(oround)
+        ts_list = ah_updates.get(float(line))
+        if ts_list:
+            out["ah_last_update_ts"] = max(ts_list)
 
     # —— 角球 OU 主盘
     cmain = None
@@ -333,6 +487,9 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
         out["crn_main_line"] = float(line)
         out["crn_main_over"], out["crn_main_under"] = float(om), float(um)
         out["crn_main_over_cnt"], out["crn_main_under_cnt"], out["crn_main_overround"] = int(co), int(cu), float(oround)
+        ts_list = cr_updates.get(float(line))
+        if ts_list:
+            out["crn_main_last_update_ts"] = max(ts_list)
 
     # —— 全线快照（用于“全线 Top 10”打印） —— #
     ou_all_list = []
@@ -388,12 +545,16 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
             outm[key] = {"home": home, "away": away}
         return outm
 
-    out["_raw_ou_map"]  = _clean_ou_or_cr_map(ou_map)
-    out["_raw_crn_map"] = _clean_ou_or_cr_map(cr_map)
-    out["_raw_ah_map"]  = _clean_ah_map(ah_map)
+    clean_ou_map = _clean_ou_or_cr_map(ou_map)
+    clean_cr_map = _clean_ou_or_cr_map(cr_map)
+    clean_ah_map = _clean_ah_map(ah_map)
+
+    out["_raw_ou_map"]  = clean_ou_map
+    out["_raw_crn_map"] = clean_cr_map
+    out["_raw_ah_map"]  = clean_ah_map
 
     # —— 已清洗“全线矩阵”摘要（中位数、样本、超额） —— #
-    def pack_ou_lines(src: Dict[float, Dict[str, List[float]]]) -> Dict[str, Dict[str, float]]:
+    def pack_ou_lines(src: Dict[float, Dict[str, List[float]]], updates: dict[float, List[float]]) -> Dict[str, Dict[str, float]]:
         res: Dict[str, Dict[str, float]] = {}
         for line, sides in src.items():
             ov = [x for x in sides.get("over", []) if x]
@@ -404,16 +565,20 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
             if not om or not um:
                 continue
             overround = 1.0/om + 1.0/um
-            res[str(float(line))] = {
+            entry = {
                 "over_median": float(om),
                 "under_median": float(um),
                 "over_cnt": int(len(ov)),
                 "under_cnt": int(len(un)),
                 "overround": float(overround),
             }
+            ts_list = updates.get(float(line))
+            if ts_list:
+                entry["last_update_ts"] = max(ts_list)
+            res[str(float(line))] = entry
         return res
 
-    def pack_ah_lines(src: Dict[float, Dict[str, List[float]]]) -> Dict[str, Dict[str, float]]:
+    def pack_ah_lines(src: Dict[float, Dict[str, List[float]]], updates: dict[float, List[float]]) -> Dict[str, Dict[str, float]]:
         res: Dict[str, Dict[str, float]] = {}
         for line, sides in src.items():
             hs = [x for x in sides.get("home", []) if x]
@@ -424,18 +589,22 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
             if not oh or not oa:
                 continue
             overround = 1.0/oh + 1.0/oa
-            res[str(float(line))] = {
+            entry = {
                 "home_median": float(oh),
                 "away_median": float(oa),
                 "home_cnt": int(len(hs)),
                 "away_cnt": int(len(as_)),
                 "overround": float(overround),
             }
+            ts_list = updates.get(float(line))
+            if ts_list:
+                entry["last_update_ts"] = max(ts_list)
+            res[str(float(line))] = entry
         return res
 
-    out["ou_lines"]  = pack_ou_lines(out["_raw_ou_map"])
-    out["crn_lines"] = pack_ou_lines(out["_raw_crn_map"])
-    out["ah_lines"]  = pack_ah_lines(out["_raw_ah_map"])
+    out["ou_lines"]  = pack_ou_lines(clean_ou_map, ou_updates)
+    out["crn_lines"] = pack_ou_lines(clean_cr_map, cr_updates)
+    out["ah_lines"]  = pack_ah_lines(clean_ah_map, ah_updates)
 
     return out
 
