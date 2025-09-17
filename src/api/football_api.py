@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import os, json, time, hashlib, threading
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -42,6 +43,44 @@ _SESSION.mount("http://", _ADAPTER)
 _SESSION_LOCK = threading.Lock()
 
 _MEMO: Dict[str, tuple[float, dict]] = {}
+
+
+def _parse_update_minutes(value: Any, now_ts: float) -> Optional[float]:
+    """Convert bookmaker update timestamps to "age" in minutes.
+
+    The API may emit ISO8601 strings either with a trailing ``Z`` or explicit
+    timezone offsets.  When parsing fails we return ``None`` so callers can
+    decide how strictly to treat missing freshness information.
+    """
+
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+
+    dt: Optional[datetime] = None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        # Fallback formats observed occasionally without timezone markers.
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                dt = datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+            else:
+                dt = dt.replace(tzinfo=timezone.utc)
+                break
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    age_minutes = max(0.0, (now_ts - dt.timestamp()) / 60.0)
+    return float(age_minutes)
 
 def _memo_key(endpoint: str, params: dict) -> str:
     s = json.dumps({"e": endpoint, "p": params}, sort_keys=True, separators=(",", ":"))
@@ -174,14 +213,55 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
         except Exception:
             pass
 
+    now_ts = time.time()
+
     h_list, d_list, a_list = [], [], []
-    ou_map: Dict[float, Dict[str, List[float]]] = {}
-    ah_map: Dict[float, Dict[str, List[float]]] = {}   # home_line -> {"home": [], "away": []}
-    cr_map: Dict[float, Dict[str, List[float]]] = {}
+    h_bm: set[str] = set(); d_bm: set[str] = set(); a_bm: set[str] = set()
+    h_updates: List[float] = []; d_updates: List[float] = []; a_updates: List[float] = []
+
+    ou_map: Dict[float, Dict[str, Any]] = {}
+    ah_map: Dict[float, Dict[str, Any]] = {}   # home_line -> {"home": [], "away": []}
+    cr_map: Dict[float, Dict[str, Any]] = {}
+
+    def _ou_bucket(dst: Dict[float, Dict[str, Any]], line_val: float) -> Dict[str, Any]:
+        return dst.setdefault(
+            float(line_val),
+            {
+                "over": [],
+                "under": [],
+                "_over_bm": set(),
+                "_under_bm": set(),
+                "_over_updates": [],
+                "_under_updates": [],
+            },
+        )
+
+    def _ah_bucket(line_val: float) -> Dict[str, Any]:
+        return ah_map.setdefault(
+            float(line_val),
+            {
+                "home": [],
+                "away": [],
+                "_home_bm": set(),
+                "_away_bm": set(),
+                "_home_updates": [],
+                "_away_updates": [],
+            },
+        )
 
     # —— 解析各博彩公司盘口 —— #
     for item in data.get("response", []):
         for bk in item.get("bookmakers") or []:
+            bk_id = bk.get("id")
+            bk_name = bk.get("name")
+            if bk_id is not None:
+                bk_key = f"{bk_id}"
+            elif bk_name:
+                bk_key = str(bk_name)
+            else:
+                bk_key = f"bk_{id(bk)}"
+            update_age = _parse_update_minutes(bk.get("update"), now_ts)
+
             for b in bk.get("bets") or []:
                 name = b.get("name") or ""
                 values = b.get("values") or []
@@ -191,9 +271,27 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                     for v in values:
                         val = (v.get("value") or "").lower().strip()
                         odd = v.get("odd")
-                        if val in ("home","1"): _add_safe(h_list, odd)
-                        elif val in ("draw","x"): _add_safe(d_list, odd)
-                        elif val in ("away","2"): _add_safe(a_list, odd)
+                        if val in ("home","1"):
+                            before = len(h_list)
+                            _add_safe(h_list, odd)
+                            if len(h_list) != before:
+                                h_bm.add(bk_key)
+                                if update_age is not None:
+                                    h_updates.append(update_age)
+                        elif val in ("draw","x"):
+                            before = len(d_list)
+                            _add_safe(d_list, odd)
+                            if len(d_list) != before:
+                                d_bm.add(bk_key)
+                                if update_age is not None:
+                                    d_updates.append(update_age)
+                        elif val in ("away","2"):
+                            before = len(a_list)
+                            _add_safe(a_list, odd)
+                            if len(a_list) != before:
+                                a_bm.add(bk_key)
+                                if update_age is not None:
+                                    a_updates.append(update_age)
 
                 # 进球 OU（含 Asian Total / Goal Line）
                 if is_goal_ou(name):
@@ -207,10 +305,18 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                             elif s.startswith("under"): line = _parse_float(s[5:])
                         if line is None:
                             continue
-                        if side_txt.startswith("over"):
-                            ou_map.setdefault(float(line), {"over": [], "under": []})["over"].append(_parse_float(odd) or 0.0)
-                        elif side_txt.startswith("under"):
-                            ou_map.setdefault(float(line), {"over": [], "under": []})["under"].append(_parse_float(odd) or 0.0)
+                        bucket = _ou_bucket(ou_map, float(line))
+                        val = _parse_float(odd)
+                        if side_txt.startswith("over") and val:
+                            bucket["over"].append(val)
+                            bucket["_over_bm"].add(bk_key)
+                            if update_age is not None:
+                                bucket["_over_updates"].append(update_age)
+                        elif side_txt.startswith("under") and val:
+                            bucket["under"].append(val)
+                            bucket["_under_bm"].add(bk_key)
+                            if update_age is not None:
+                                bucket["_under_updates"].append(update_age)
 
                 # 角球 OU
                 if is_corners_ou(name):
@@ -224,10 +330,18 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                             elif s.startswith("under"): line = _parse_float(s[5:])
                         if line is None:
                             continue
-                        if side_txt.startswith("over"):
-                            cr_map.setdefault(float(line), {"over": [], "under": []})["over"].append(_parse_float(odd) or 0.0)
-                        elif side_txt.startswith("under"):
-                            cr_map.setdefault(float(line), {"over": [], "under": []})["under"].append(_parse_float(odd) or 0.0)
+                        bucket = _ou_bucket(cr_map, float(line))
+                        val = _parse_float(odd)
+                        if side_txt.startswith("over") and val:
+                            bucket["over"].append(val)
+                            bucket["_over_bm"].add(bk_key)
+                            if update_age is not None:
+                                bucket["_over_updates"].append(update_age)
+                        elif side_txt.startswith("under") and val:
+                            bucket["under"].append(val)
+                            bucket["_under_bm"].add(bk_key)
+                            if update_age is not None:
+                                bucket["_under_updates"].append(update_age)
 
                 # 亚洲让球（非角球）
                 if is_asian_handicap(name):
@@ -252,23 +366,44 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                         if resolved_line is None:
                             resolved_line = line_val if side_txt == "home" else -line_val
 
-                        ah_map.setdefault(resolved_line, {"home": [], "away": []})
-                        ah_map[resolved_line][side_txt].append(odd)
+                        bucket = _ah_bucket(resolved_line)
+                        bucket[side_txt].append(odd)
+                        bm_key = "_home_bm" if side_txt == "home" else "_away_bm"
+                        upd_key = "_home_updates" if side_txt == "home" else "_away_updates"
+                        bucket[bm_key].add(bk_key)
+                        if update_age is not None:
+                            bucket[upd_key].append(update_age)
 
     out: Dict[str, float] = {}
 
     # —— 1X2 主盘中位
     mh, md, ma = _median(h_list), _median(d_list), _median(a_list)
+    cnt_h, cnt_d, cnt_a = len(h_bm), len(d_bm), len(a_bm)
+    bm_count = min(cnt_h, cnt_d, cnt_a) if all(x > 0 for x in (cnt_h, cnt_d, cnt_a)) else 0
+    max_update = None
+    updates_combined: List[float] = [
+        *([x for x in h_updates if x is not None]),
+        *([x for x in d_updates if x is not None]),
+        *([x for x in a_updates if x is not None]),
+    ]
+    if updates_combined:
+        max_update = float(max(updates_combined))
     if mh and md and ma:
         imp_sum = 1.0/mh + 1.0/md + 1.0/ma
-        if 1.02 <= imp_sum <= 1.30 and min(len(h_list),len(d_list),len(a_list)) >= 2:
+        if 1.02 <= imp_sum <= 1.30 and bm_count >= 2:
             out["1x2_home"], out["1x2_draw"], out["1x2_away"] = mh, md, ma
+            out["1x2_overround"] = float(imp_sum)
+            out["1x2_bookmaker_count"] = int(bm_count)
+            if max_update is not None:
+                out["1x2_max_update_minutes"] = max_update
 
     # —— Goals OU 主盘
     main = None
     for line, sides in ou_map.items():
-        co = len([x for x in sides.get("over", []) if x])
-        cu = len([x for x in sides.get("under", []) if x])
+        bm_over = len(sides.get("_over_bm", []))
+        bm_under = len(sides.get("_under_bm", []))
+        co = bm_over if bm_over else len([x for x in sides.get("over", []) if x])
+        cu = bm_under if bm_under else len([x for x in sides.get("under", []) if x])
         if co >= 2 and cu >= 2:
             om = _median(sides["over"]); um = _median(sides["under"])
             if not om or not um:
@@ -276,14 +411,22 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
             oround = 1.0/om + 1.0/um
             if not (1.02 <= oround <= 1.18):
                 continue
-            cand = (co+cu, -abs(1.0/om - 1.0/um), float(line), om, um, co, cu, oround)
+            updates = [
+                *[x for x in sides.get("_over_updates", []) if x is not None],
+                *[x for x in sides.get("_under_updates", []) if x is not None],
+            ]
+            max_update = float(max(updates)) if updates else None
+            cand = (co+cu, -abs(1.0/om - 1.0/um), float(line), om, um, co, cu, oround, max_update)
             if (main is None) or (cand > main):
                 main = cand
     if main:
-        _,_,line,om,um,co,cu,oround = main
+        *_, line, om, um, co, cu, oround, max_update = main
         out["ou_main_line"] = float(line)
         out["ou_main_over"], out["ou_main_under"] = float(om), float(um)
         out["ou_main_over_cnt"], out["ou_main_under_cnt"], out["ou_main_overround"] = int(co), int(cu), float(oround)
+        out["ou_main_bookmaker_count"] = int(min(co, cu))
+        if max_update is not None:
+            out["ou_main_max_update_minutes"] = float(max_update)
 
     # —— Goals OU@2.5 参考
     if 2.5 in ou_map:
@@ -298,7 +441,10 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
     pick = None
     for line, sides in ah_map.items():
         hs, as_ = sides.get("home", []), sides.get("away", [])
-        ch, ca = len(hs), len(as_)
+        bm_home = len(sides.get("_home_bm", []))
+        bm_away = len(sides.get("_away_bm", []))
+        ch = bm_home if bm_home else len(hs)
+        ca = bm_away if bm_away else len(as_)
         if ch >= 1 and ca >= 1:
             oh, oa = _median(hs), _median(as_)
             if not oh or not oa:
@@ -306,18 +452,29 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
             oround = 1.0/oh + 1.0/oa
             if not (1.00 <= oround <= 1.25):
                 continue
-            cand = (abs(line), abs(oh - oa), float(line), oh, oa, ch, ca, oround)
+            updates = [
+                *[x for x in sides.get("_home_updates", []) if x is not None],
+                *[x for x in sides.get("_away_updates", []) if x is not None],
+            ]
+            max_update = float(max(updates)) if updates else None
+            cand = (abs(line), abs(oh - oa), float(line), oh, oa, ch, ca, oround, max_update)
             if (pick is None) or (cand < pick):
                 pick = cand
     if pick:
-        _,_,line,oh,oa,ch,ca,oround = pick
+        *_, line, oh, oa, ch, ca, oround, max_update = pick
         out["ah_line"], out["ah_home_odds"], out["ah_away_odds"] = float(line), float(oh), float(oa)
         out["ah_home_cnt"], out["ah_away_cnt"], out["ah_overround"] = int(ch), int(ca), float(oround)
+        out["ah_bookmaker_count"] = int(min(ch, ca))
+        if max_update is not None:
+            out["ah_max_update_minutes"] = float(max_update)
 
     # —— 角球 OU 主盘
     cmain = None
     for line, sides in cr_map.items():
-        co = len([x for x in sides.get("over", []) if x]); cu = len([x for x in sides.get("under", []) if x])
+        bm_over = len(sides.get("_over_bm", []))
+        bm_under = len(sides.get("_under_bm", []))
+        co = bm_over if bm_over else len([x for x in sides.get("over", []) if x])
+        cu = bm_under if bm_under else len([x for x in sides.get("under", []) if x])
         if co >= 2 and cu >= 2:
             om = _median(sides["over"]); um = _median(sides["under"])
             if not om or not um:
@@ -325,41 +482,91 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
             oround = 1.0/om + 1.0/um
             if not (1.02 <= oround <= 1.20):
                 continue
-            cand = (co+cu, -abs(1.0/om - 1.0/um), float(line), om, um, co, cu, oround)
+            updates = [
+                *[x for x in sides.get("_over_updates", []) if x is not None],
+                *[x for x in sides.get("_under_updates", []) if x is not None],
+            ]
+            max_update = float(max(updates)) if updates else None
+            cand = (co+cu, -abs(1.0/om - 1.0/um), float(line), om, um, co, cu, oround, max_update)
             if (cmain is None) or (cand > cmain):
                 cmain = cand
     if cmain:
-        _,_,line,om,um,co,cu,oround = cmain
+        *_, line, om, um, co, cu, oround, max_update = cmain
         out["crn_main_line"] = float(line)
         out["crn_main_over"], out["crn_main_under"] = float(om), float(um)
         out["crn_main_over_cnt"], out["crn_main_under_cnt"], out["crn_main_overround"] = int(co), int(cu), float(oround)
+        out["crn_main_bookmaker_count"] = int(min(co, cu))
+        if max_update is not None:
+            out["crn_main_max_update_minutes"] = float(max_update)
 
     # —— 全线快照（用于“全线 Top 10”打印） —— #
     ou_all_list = []
     for line, sides in ou_map.items():
-        ov, un = [x for x in sides.get("over", []) if x], [x for x in sides.get("under", []) if x]
-        if len(ov) >= 1 and len(un) >= 1:
-            om, um = _median(ov), _median(un)
-            if not om or not um:
-                continue
-            oround = 1.0/om + 1.0/um
-            if 1.00 <= oround <= 1.25:
-                ou_all_list.append({"line": float(line), "over": float(om), "under": float(um),
-                                    "co": int(len(ov)), "cu": int(len(un)), "overround": float(oround)})
+        ov = [x for x in sides.get("over", []) if x]
+        un = [x for x in sides.get("under", []) if x]
+        if not ov or not un:
+            continue
+        om, um = _median(ov), _median(un)
+        if not om or not um:
+            continue
+        oround = 1.0/om + 1.0/um
+        if 1.00 <= oround <= 1.25:
+            bm_over = len(sides.get("_over_bm", []))
+            bm_under = len(sides.get("_under_bm", []))
+            co = bm_over if bm_over else len(ov)
+            cu = bm_under if bm_under else len(un)
+            updates = [
+                *[x for x in sides.get("_over_updates", []) if x is not None],
+                *[x for x in sides.get("_under_updates", []) if x is not None],
+            ]
+            max_update = float(max(updates)) if updates else None
+            entry = {
+                "line": float(line),
+                "over": float(om),
+                "under": float(um),
+                "co": int(co),
+                "cu": int(cu),
+                "bookmakers": int(min(co, cu)),
+                "overround": float(oround),
+            }
+            if max_update is not None:
+                entry["max_update_minutes"] = max_update
+            ou_all_list.append(entry)
     if ou_all_list:
         out["ou_all"] = sorted(ou_all_list, key=lambda x: x["line"])
 
     crn_all_list = []
     for line, sides in cr_map.items():
-        ov, un = [x for x in sides.get("over", []) if x], [x for x in sides.get("under", []) if x]
-        if len(ov) >= 1 and len(un) >= 1:
-            om, um = _median(ov), _median(un)
-            if not om or not um:
-                continue
-            oround = 1.0/om + 1.0/um
-            if 1.00 <= oround <= 1.30:
-                crn_all_list.append({"line": float(line), "over": float(om), "under": float(um),
-                                     "co": int(len(ov)), "cu": int(len(un)), "overround": float(oround)})
+        ov = [x for x in sides.get("over", []) if x]
+        un = [x for x in sides.get("under", []) if x]
+        if not ov or not un:
+            continue
+        om, um = _median(ov), _median(un)
+        if not om or not um:
+            continue
+        oround = 1.0/om + 1.0/um
+        if 1.00 <= oround <= 1.30:
+            bm_over = len(sides.get("_over_bm", []))
+            bm_under = len(sides.get("_under_bm", []))
+            co = bm_over if bm_over else len(ov)
+            cu = bm_under if bm_under else len(un)
+            updates = [
+                *[x for x in sides.get("_over_updates", []) if x is not None],
+                *[x for x in sides.get("_under_updates", []) if x is not None],
+            ]
+            max_update = float(max(updates)) if updates else None
+            entry = {
+                "line": float(line),
+                "over": float(om),
+                "under": float(um),
+                "co": int(co),
+                "cu": int(cu),
+                "bookmakers": int(min(co, cu)),
+                "overround": float(oround),
+            }
+            if max_update is not None:
+                entry["max_update_minutes"] = max_update
+            crn_all_list.append(entry)
     if crn_all_list:
         out["crn_all"] = sorted(crn_all_list, key=lambda x: x["line"])
 
@@ -393,7 +600,17 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
     out["_raw_ah_map"]  = _clean_ah_map(ah_map)
 
     # —— 已清洗“全线矩阵”摘要（中位数、样本、超额） —— #
-    def pack_ou_lines(src: Dict[float, Dict[str, List[float]]]) -> Dict[str, Dict[str, float]]:
+    def _collect_updates(src_val: Any) -> List[float]:
+        if isinstance(src_val, Sequence) and not isinstance(src_val, (str, bytes)):
+            return [float(x) for x in src_val if x is not None]
+        return []
+
+    def _len_collection(src_val: Any) -> int:
+        if isinstance(src_val, (set, list, tuple)):
+            return len([x for x in src_val if x is not None])
+        return 0
+
+    def pack_ou_lines(src: Dict[float, Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
         res: Dict[str, Dict[str, float]] = {}
         for line, sides in src.items():
             ov = [x for x in sides.get("over", []) if x]
@@ -404,16 +621,25 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
             if not om or not um:
                 continue
             overround = 1.0/om + 1.0/um
-            res[str(float(line))] = {
+            bm_over = _len_collection(sides.get("_over_bm"))
+            bm_under = _len_collection(sides.get("_under_bm"))
+            co = bm_over if bm_over else len(ov)
+            cu = bm_under if bm_under else len(un)
+            updates = _collect_updates(sides.get("_over_updates")) + _collect_updates(sides.get("_under_updates"))
+            entry = {
                 "over_median": float(om),
                 "under_median": float(um),
-                "over_cnt": int(len(ov)),
-                "under_cnt": int(len(un)),
+                "over_cnt": int(co),
+                "under_cnt": int(cu),
                 "overround": float(overround),
+                "bookmaker_count": int(min(co, cu)),
             }
+            if updates:
+                entry["max_update_minutes"] = float(max(updates))
+            res[str(float(line))] = entry
         return res
 
-    def pack_ah_lines(src: Dict[float, Dict[str, List[float]]]) -> Dict[str, Dict[str, float]]:
+    def pack_ah_lines(src: Dict[float, Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
         res: Dict[str, Dict[str, float]] = {}
         for line, sides in src.items():
             hs = [x for x in sides.get("home", []) if x]
@@ -424,18 +650,27 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
             if not oh or not oa:
                 continue
             overround = 1.0/oh + 1.0/oa
-            res[str(float(line))] = {
+            bm_home = _len_collection(sides.get("_home_bm"))
+            bm_away = _len_collection(sides.get("_away_bm"))
+            ch = bm_home if bm_home else len(hs)
+            ca = bm_away if bm_away else len(as_)
+            updates = _collect_updates(sides.get("_home_updates")) + _collect_updates(sides.get("_away_updates"))
+            entry = {
                 "home_median": float(oh),
                 "away_median": float(oa),
-                "home_cnt": int(len(hs)),
-                "away_cnt": int(len(as_)),
+                "home_cnt": int(ch),
+                "away_cnt": int(ca),
                 "overround": float(overround),
+                "bookmaker_count": int(min(ch, ca)),
             }
+            if updates:
+                entry["max_update_minutes"] = float(max(updates))
+            res[str(float(line))] = entry
         return res
 
-    out["ou_lines"]  = pack_ou_lines(out["_raw_ou_map"])
-    out["crn_lines"] = pack_ou_lines(out["_raw_crn_map"])
-    out["ah_lines"]  = pack_ah_lines(out["_raw_ah_map"])
+    out["ou_lines"]  = pack_ou_lines(ou_map)
+    out["crn_lines"] = pack_ou_lines(cr_map)
+    out["ah_lines"]  = pack_ah_lines(ah_map)
 
     return out
 
