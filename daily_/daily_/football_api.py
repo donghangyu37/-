@@ -1,7 +1,7 @@
 # === src/api/football_api.py · 并发复用 + 退避重试 + 限速 + 轻量缓存 + 主盘/全线聚合（含角球/Asian Totals） ===
 from __future__ import annotations
 
-import os, json, time, hashlib, threading
+import os, json, time, hashlib, threading, re
 from typing import Any, Dict, List, Optional
 import requests
 from requests.adapters import HTTPAdapter
@@ -155,6 +155,17 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
         except Exception:
             return None
 
+    def _extract_total_line(value: Any) -> Optional[float]:
+        text = str(value or "").lower()
+        for keyword in ("over", "under"):
+            idx = text.find(keyword)
+            if idx == -1:
+                continue
+            match = re.search(r"[-+]?\d+(?:[.,]\d+)?", text[idx + len(keyword):])
+            if match:
+                return _parse_float(match.group(0))
+        return None
+
     def _add_safe(lst, odd):
         try:
             v = float(odd)
@@ -191,9 +202,7 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                         odd = v.get("odd")
                         line = _parse_float(v.get("handicap"))
                         if line is None:
-                            s = side_txt.replace(" ", "")
-                            if s.startswith("over"):  line = _parse_float(s[4:])
-                            elif s.startswith("under"): line = _parse_float(s[5:])
+                            line = _extract_total_line(v.get("value"))
                         if line is None:
                             continue
                         if side_txt.startswith("over"):
@@ -208,9 +217,7 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                         odd = v.get("odd")
                         line = _parse_float(v.get("handicap"))
                         if line is None:
-                            s = side_txt.replace(" ", "")
-                            if s.startswith("over"):  line = _parse_float(s[4:])
-                            elif s.startswith("under"): line = _parse_float(s[5:])
+                            line = _extract_total_line(v.get("value"))
                         if line is None:
                             continue
                         if side_txt.startswith("over"):
