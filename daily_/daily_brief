@@ -149,6 +149,12 @@ def apply_ev_filter(
     flag_map: Dict[str, str],
     reason_map: Dict[str, str],
     vi_map: Dict[str, float | None],
+    meta_map: Dict[str, Dict[str, float | str]] | None = None,
+    odds: float | None = None,
+    model_prob: float | None = None,
+    consensus_prob: float | None = None,
+    data_quality: float | None = None,
+    sample_size: float | None = None,
 ) -> tuple[float | None, float | None]:
     if ev is None or kelly is None:
         flag_map[key] = "invalid"
@@ -163,6 +169,11 @@ def apply_ev_filter(
         min_bookmakers=min_bookmakers,
         overround=overround,
         update_age=update_age,
+        odds=odds,
+        model_probability=model_prob,
+        consensus_probability=consensus_prob,
+        data_quality=data_quality,
+        sample_size=sample_size,
     )
     flag = res.get("tag", "invalid")
     flag_map[key] = flag
@@ -170,6 +181,28 @@ def apply_ev_filter(
     if reasons:
         reason_map[key] = ",".join(str(r) for r in reasons)
     vi_map[key] = res.get("value_index")
+    if meta_map is not None:
+        meta_entry: Dict[str, float | str] = {}
+        quality = res.get("quality")
+        if quality is not None:
+            try:
+                meta_entry["quality"] = round(float(quality), 6)
+            except (TypeError, ValueError):
+                pass
+        ev_input = res.get("ev_input")
+        if ev_input is not None:
+            try:
+                meta_entry["ev_input"] = round(float(ev_input), 6)
+            except (TypeError, ValueError):
+                pass
+        ev_cal = res.get("ev_calibrated")
+        if ev_cal is not None:
+            try:
+                meta_entry["ev_calibrated"] = round(float(ev_cal), 6)
+            except (TypeError, ValueError):
+                pass
+        if meta_entry:
+            meta_map[key] = meta_entry
     return res.get("ev"), res.get("kelly")
 
 # ===== 四分之一盘精结算（基于 totals 样本）=====
@@ -256,8 +289,26 @@ def ou_ev_kelly_from_totals_quarter(line: float, over_odds: float, under_odds: f
     K_over  = 0.0 if b_over  <= 0 else max(0.0, (b_over*pwin_o  - plose_o)/b_over)
     K_under = 0.0 if b_under <= 0 else max(0.0, (b_under*pwin_u - plose_u)/b_under)
 
-    return {"EV_over": float(EV_over), "Kelly_over": float(K_over),
-            "EV_under": float(EV_under), "Kelly_under": float(K_under)}
+    return {
+        "EV_over": float(EV_over),
+        "Kelly_over": float(K_over),
+        "EV_under": float(EV_under),
+        "Kelly_under": float(K_under),
+        "p_over_full_win": float(fw_o),
+        "p_over_half_win": float(hw_o),
+        "p_over_push": float(pu_o),
+        "p_over_half_loss": float(hl_o),
+        "p_over_full_loss": float(fl_o),
+        "p_under_full_win": float(fw_u),
+        "p_under_half_win": float(hw_u),
+        "p_under_push": float(pu_u),
+        "p_under_half_loss": float(hl_u),
+        "p_under_full_loss": float(fl_u),
+        "p_over_success": float(pwin_o),
+        "p_over_negative": float(plose_o),
+        "p_under_success": float(pwin_u),
+        "p_under_negative": float(plose_u),
+    }
 
 def _regression_check_quarter_under() -> None:
     """Verify under-quarter lines treat integer totals as half wins."""
@@ -663,6 +714,35 @@ def _stake_pct_from_kelly(k: Optional[float]) -> float:
 
 def export_picks(rows_all: List[Dict], date_str: str):
     picks: List[Dict] = []
+
+    def _with_quality(payload: Dict, row: Dict, key: str) -> Dict:
+        out = dict(payload)
+        quality_val = row.get(f"quality_{key}")
+        if quality_val is not None:
+            try:
+                out["quality"] = float(quality_val)
+            except (TypeError, ValueError):
+                pass
+        ev_input_val = row.get(f"ev_input_{key}")
+        if ev_input_val is not None:
+            try:
+                out["ev_input"] = float(ev_input_val)
+            except (TypeError, ValueError):
+                pass
+        ev_cal_val = row.get(f"ev_calibrated_{key}")
+        if ev_cal_val is not None:
+            try:
+                out["ev_calibrated"] = float(ev_cal_val)
+            except (TypeError, ValueError):
+                pass
+        score_val = row.get(f"score_{key}")
+        if score_val is not None:
+            try:
+                out["score"] = float(score_val)
+            except (TypeError, ValueError):
+                pass
+        return out
+
     for r in rows_all:
         base = {"date_utc": r.get("date_utc"), "kickoff_utc": r.get("kickoff_utc"),
                 "league": r.get("league"), "home": r.get("home"), "away": r.get("away")}
@@ -671,14 +751,16 @@ def export_picks(rows_all: List[Dict], date_str: str):
         if ev is not None and k is not None and r.get("flag_ev_ou_main_over") == "keep":
             vi = value_index(ev, k)
             if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                picks.append({**base, "market":"OU-Over", "book":_fmt_ou_book(r.get("ou_main_line"), r.get("odds_ou_main_over"), False),
-                              "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)})
+                payload = {**base, "market":"OU-Over", "book":_fmt_ou_book(r.get("ou_main_line"), r.get("odds_ou_main_over"), False),
+                           "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)}
+                picks.append(_with_quality(payload, r, "ev_ou_main_over"))
         ev, k = r.get("ev_ou_main_under"), r.get("kelly_ou_main_under")
         if ev is not None and k is not None and r.get("flag_ev_ou_main_under") == "keep":
             vi = value_index(ev, k)
             if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                picks.append({**base, "market":"OU-Under", "book":_fmt_ou_book(r.get("ou_main_line"), r.get("odds_ou_main_under"), False),
-                              "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)})
+                payload = {**base, "market":"OU-Under", "book":_fmt_ou_book(r.get("ou_main_line"), r.get("odds_ou_main_under"), False),
+                           "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)}
+                picks.append(_with_quality(payload, r, "ev_ou_main_under"))
         # 1X2
         for mk, evk, kel, odd in [
             ("1X2-Home", r.get("ev_1x2_home"), r.get("kelly_1x2_home"), r.get("odds_1x2_home")),
@@ -689,8 +771,10 @@ def export_picks(rows_all: List[Dict], date_str: str):
             if evk is not None and kel is not None and odd is not None and r.get(flag_key) == "keep":
                 vi = value_index(evk, kel)
                 if evk>=PICKS_MIN_EV and kel>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                    picks.append({**base, "market":mk, "book":f"{mk}@{float(odd):.2f}",
-                                  "ev":float(evk),"kelly":float(kel),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(kel)})
+                    payload = {**base, "market":mk, "book":f"{mk}@{float(odd):.2f}",
+                               "ev":float(evk),"kelly":float(kel),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(kel)}
+                    key = "ev_1x2_home" if mk == "1X2-Home" else "ev_1x2_draw" if mk == "1X2-Draw" else "ev_1x2_away"
+                    picks.append(_with_quality(payload, r, key))
         # AH 主盘
         ah_line = r.get("ah_line")
         if ah_line is not None:
@@ -702,22 +786,25 @@ def export_picks(rows_all: List[Dict], date_str: str):
                 if evk is not None and kel is not None and odd is not None and r.get(flag_key) == "keep":
                     vi = value_index(evk, kel)
                     if evk>=PICKS_MIN_EV and kel>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                        picks.append({**base, "market":f"AH-{'Home' if side=='home' else 'Away'}",
-                                      "book":_fmt_ah_book(ah_line, odd, side),
-                                      "ev":float(evk),"kelly":float(kel),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(kel)})
+                        payload = {**base, "market":f"AH-{'Home' if side=='home' else 'Away'}",
+                                   "book":_fmt_ah_book(ah_line, odd, side),
+                                   "ev":float(evk),"kelly":float(kel),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(kel)}
+                        picks.append(_with_quality(payload, r, f"ev_ah_{side}"))
         # 角球 OU 主盘
         ev, k = r.get("ev_crn_main_over"), r.get("kelly_crn_main_over")
         if ev is not None and k is not None and r.get("flag_ev_crn_main_over") == "keep":
             vi = value_index(ev, k)
             if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                picks.append({**base,"market":"CRN-Over","book":_fmt_ou_book(r.get("crn_main_line"), r.get("odds_crn_main_over"), True),
-                              "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)})
+                payload = {**base,"market":"CRN-Over","book":_fmt_ou_book(r.get("crn_main_line"), r.get("odds_crn_main_over"), True),
+                           "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)}
+                picks.append(_with_quality(payload, r, "ev_crn_main_over"))
         ev, k = r.get("ev_crn_main_under"), r.get("kelly_crn_main_under")
         if ev is not None and k is not None and r.get("flag_ev_crn_main_under") == "keep":
             vi = value_index(ev, k)
             if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                picks.append({**base,"market":"CRN-Under","book":_fmt_ou_book(r.get("crn_main_line"), r.get("odds_crn_main_under"), True),
-                              "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)})
+                payload = {**base,"market":"CRN-Under","book":_fmt_ou_book(r.get("crn_main_line"), r.get("odds_crn_main_under"), True),
+                           "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)}
+                picks.append(_with_quality(payload, r, "ev_crn_main_under"))
 
     picks.sort(key=lambda x: x.get("value_index", -999), reverse=True)
     if PICKS_TOP_N is not None:
@@ -725,9 +812,13 @@ def export_picks(rows_all: List[Dict], date_str: str):
 
     out_dir = os.path.join(os.getcwd(), "out"); os.makedirs(out_dir, exist_ok=True)
     out_file = os.path.join(out_dir, f"picks_{date_str}.csv")
-    fieldnames = ["date_utc","kickoff_utc","league","home","away","market","book","ev","kelly","value_index","stake_pct"]
+    fieldnames = [
+        "date_utc","kickoff_utc","league","home","away","market","book",
+        "ev","kelly","value_index","stake_pct","quality","ev_input","ev_calibrated","score"
+    ]
     with open(out_file, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames); w.writeheader(); [w.writerow(p) for p in picks]
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader(); [w.writerow(p) for p in picks]
     print(f"\n已导出下注清单到: {out_file}  （{len(picks)} 条，阈值：EV≥{PICKS_MIN_EV}, Kelly≥{PICKS_MIN_KELLY}, VI≥{PICKS_MIN_VI}）")
 
 def _median(arr: List[float]) -> Optional[float]:
@@ -929,6 +1020,27 @@ def main():
         if LOG_LAMBDA_BLEND:
             log_lambda_blend(home_name, away_name, lambda_models, lam_weights, lam_home, lam_away)
 
+        data_quality_score: float | None = None
+        sample_size_recent: float | None = None
+        recent_meta = (lambda_models.get("recent") or {}).get("meta") if isinstance(lambda_models.get("recent"), dict) else None
+        if isinstance(recent_meta, dict) and recent_meta:
+            try:
+                eff_home = float(recent_meta.get("home_eff_mix", 1.0))
+            except (TypeError, ValueError):
+                eff_home = 1.0
+            try:
+                eff_away = float(recent_meta.get("away_eff_mix", 1.0))
+            except (TypeError, ValueError):
+                eff_away = 1.0
+            coverage = 1.0 - 0.5 * (max(0.0, min(1.0, eff_home)) + max(0.0, min(1.0, eff_away)))
+            data_quality_score = max(0.0, min(1.0, coverage))
+            try:
+                hg = float(recent_meta.get("home_games_used", 0.0))
+                ag = float(recent_meta.get("away_games_used", 0.0))
+                sample_size_recent = max(0.0, 0.5 * (hg + ag))
+            except (TypeError, ValueError):
+                sample_size_recent = None
+
         sim = monte_carlo_simulate(lam_home, lam_away, n_sims=N_SIMS_GOALS, over_line=2.5)
         _, _, totals = simulate_goals(lam_home, lam_away, n_sims=N_SIMS_GOALS)
         try: totals = [int(x) for x in totals]
@@ -939,6 +1051,7 @@ def main():
         flag_map: Dict[str, str] = {}
         flag_reason_map: Dict[str, str] = {}
         vi_map: Dict[str, float | None] = {}
+        ev_meta_map: Dict[str, Dict[str, float | str]] = {}
 
         # ===== 1X2 =====
         o1_h,o1_d,o1_a = odds.get("1x2_home"),odds.get("1x2_draw"),odds.get("1x2_away")
@@ -948,6 +1061,7 @@ def main():
         overround_1x2 = odds.get("1x2_overround")
         update_age_1x2 = odds.get("1x2_update_age_min")
         ev1_h=ev1_d=ev1_a=k1_h=k1_d=k1_a=None
+        consensus_1x2: Dict[str, float] = {}
         ok1 = sanitize_1x2(o1_h,o1_d,o1_a)
         if ok1:
             o1_h,o1_d,o1_a = ok1
@@ -956,6 +1070,20 @@ def main():
             ev1_a,k1_a = ev_kelly_binary(sim["p_away"], o1_a)
             if is_ev_outlier(max([x for x in (ev1_h,ev1_d,ev1_a) if x is not None], default=0)):
                 ev1_h=ev1_d=ev1_a=k1_h=k1_d=k1_a=None
+            else:
+                try:
+                    inv_h = 1.0 / float(o1_h)
+                    inv_d = 1.0 / float(o1_d)
+                    inv_a = 1.0 / float(o1_a)
+                    total_inv = inv_h + inv_d + inv_a
+                    if total_inv > 0:
+                        consensus_1x2 = {
+                            "home": inv_h / total_inv,
+                            "draw": inv_d / total_inv,
+                            "away": inv_a / total_inv,
+                        }
+                except Exception:
+                    consensus_1x2 = {}
 
         cnts_1x2 = [int(c) for c in (cnt_1x2_h, cnt_1x2_d, cnt_1x2_a) if isinstance(c, (int, float)) and c > 0]
         min_cnt_1x2 = min(cnts_1x2) if cnts_1x2 else None
@@ -972,6 +1100,12 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=o1_h,
+            model_prob=sim.get("p_home"),
+            consensus_prob=consensus_1x2.get("home") if consensus_1x2 else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
         )
         ev1_d, k1_d = apply_ev_filter(
             "ev_1x2_draw",
@@ -985,6 +1119,12 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=o1_d,
+            model_prob=sim.get("p_draw"),
+            consensus_prob=consensus_1x2.get("draw") if consensus_1x2 else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
         )
         ev1_a, k1_a = apply_ev_filter(
             "ev_1x2_away",
@@ -998,6 +1138,12 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=o1_a,
+            model_prob=sim.get("p_away"),
+            consensus_prob=consensus_1x2.get("away") if consensus_1x2 else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
         )
 
         # ===== Goals OU 主盘 =====
@@ -1009,6 +1155,8 @@ def main():
         ou_overround   = odds.get("ou_main_overround") or 9.9
 
         ev_main_over = ev_main_under = k_main_over = k_main_under = None
+        p_model_ou_main_over = p_model_ou_main_under = None
+        consensus_ou_main: Dict[str, float] = {}
         if ou_main_line is not None and ou_main_over is not None and ou_main_under is not None:
             pair = sanitize_ou_pair(ou_main_over, ou_main_under)
             if pair and (not STRICT_OU_MAIN or (ou_cnt_o >= OU_MIN_CNT and ou_cnt_u >= OU_MIN_CNT and ou_overround <= OU_MAX_OR)):
@@ -1016,8 +1164,20 @@ def main():
                 res = ou_ev_kelly_from_totals_quarter(float(ou_main_line), float(ou_main_over), float(ou_main_under), totals)
                 ev_main_over, k_main_over = res["EV_over"],  res["Kelly_over"]
                 ev_main_under, k_main_under = res["EV_under"], res["Kelly_under"]
+                p_model_ou_main_over = res.get("p_over_success")
+                p_model_ou_main_under = res.get("p_under_success")
                 if is_ev_outlier(max([x for x in (ev_main_over, ev_main_under) if x is not None], default=0)):
                     ev_main_over = ev_main_under = k_main_over = k_main_under = None
+                    p_model_ou_main_over = p_model_ou_main_under = None
+                else:
+                    try:
+                        inv_o = 1.0 / float(ou_main_over)
+                        inv_u = 1.0 / float(ou_main_under)
+                        total_inv = inv_o + inv_u
+                        if total_inv > 0:
+                            consensus_ou_main = {"over": inv_o / total_inv, "under": inv_u / total_inv}
+                    except Exception:
+                        consensus_ou_main = {}
 
         cnts_ou_main = [int(c) for c in (ou_cnt_o, ou_cnt_u) if isinstance(c, (int, float)) and c > 0]
         min_cnt_ou_main = min(cnts_ou_main) if cnts_ou_main else None
@@ -1035,6 +1195,12 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=ou_main_over,
+            model_prob=p_model_ou_main_over,
+            consensus_prob=consensus_ou_main.get("over") if consensus_ou_main else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
         )
         ev_main_under, k_main_under = apply_ev_filter(
             "ev_ou_main_under",
@@ -1048,11 +1214,19 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=ou_main_under,
+            model_prob=p_model_ou_main_under,
+            consensus_prob=consensus_ou_main.get("under") if consensus_ou_main else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
         )
 
         # ===== OU@2.5 参考 =====
         o25_over,o25_under = odds.get("ou_over_2_5"),odds.get("ou_under_2_5")
         ev25_over=ev25_under=k25_over=k25_under=None
+        p_model_ou25_over = p_model_ou25_under = None
+        consensus_ou25: Dict[str, float] = {}
         ok25 = sanitize_ou_pair(o25_over,o25_under)
         overround_ou25 = None
         if ok25:
@@ -1060,13 +1234,22 @@ def main():
             res25 = ou_ev_kelly_from_totals_quarter(2.5, float(o25_over), float(o25_under), totals)
             ev25_over, k25_over = res25["EV_over"],  res25["Kelly_over"]
             ev25_under, k25_under = res25["EV_under"], res25["Kelly_under"]
+            p_model_ou25_over = res25.get("p_over_success")
+            p_model_ou25_under = res25.get("p_under_success")
             if is_ev_outlier(max([x for x in (ev25_over,ev25_under) if x is not None], default=0)):
                 ev25_over=ev25_under=k25_over=k25_under=None
+                p_model_ou25_over = p_model_ou25_under = None
             else:
                 try:
                     overround_ou25 = float(1.0/float(o25_over) + 1.0/float(o25_under))
+                    inv_o = 1.0 / float(o25_over)
+                    inv_u = 1.0 / float(o25_under)
+                    total_inv = inv_o + inv_u
+                    if total_inv > 0:
+                        consensus_ou25 = {"over": inv_o / total_inv, "under": inv_u / total_inv}
                 except Exception:
                     overround_ou25 = None
+                    consensus_ou25 = {}
 
         min_cnt_ou_25 = min_cnt_ou_main
         ev25_over, k25_over = apply_ev_filter(
@@ -1081,6 +1264,12 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=o25_over,
+            model_prob=p_model_ou25_over,
+            consensus_prob=consensus_ou25.get("over") if consensus_ou25 else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
         )
         ev25_under, k25_under = apply_ev_filter(
             "ev_ou_under2.5",
@@ -1094,6 +1283,12 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=o25_under,
+            model_prob=p_model_ou25_under,
+            consensus_prob=consensus_ou25.get("under") if consensus_ou25 else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
         )
 
         # ===== AH 全线（统一归一）
@@ -1117,16 +1312,34 @@ def main():
                 ah_update_age = pick.get("update_age_min", ah_update_age)
 
         ev_ah_h = ev_ah_a = k_ah_h = k_ah_a = None
+        p_model_ah_home = p_model_ah_away = None
+        consensus_ah: Dict[str, float] = {}
         if ah_line is not None and ah_oh is not None and ah_oa is not None:
             cnt_ah_has_line += 1
             probs_ah = ah_probabilities_from_lams(lam_home, lam_away, h=float(ah_line), n_sims=N_SIMS_GOALS)
             evk = ah_ev_kelly(probs_ah, odds_home=float(ah_oh), odds_away=float(ah_oa))
+            home_info = probs_ah.get("home", {}) if isinstance(probs_ah, dict) else {}
+            away_info = probs_ah.get("away", {}) if isinstance(probs_ah, dict) else {}
             if isinstance(evk.get("home"), dict):
                 ev_ah_h, k_ah_h = evk["home"].get("EV"), evk["home"].get("Kelly")
             if isinstance(evk.get("away"), dict):
                 ev_ah_a, k_ah_a = evk["away"].get("EV"), evk["away"].get("Kelly")
             if is_ev_outlier(max([x for x in (ev_ah_h, ev_ah_a) if x is not None], default=0)):
                 ev_ah_h = ev_ah_a = k_ah_h = k_ah_a = None
+            else:
+                try:
+                    p_model_ah_home = float(home_info.get("p_win", 0.0)) + 0.5 * float(home_info.get("p_push", 0.0))
+                    p_model_ah_away = float(away_info.get("p_win", 0.0)) + 0.5 * float(away_info.get("p_push", 0.0))
+                except Exception:
+                    p_model_ah_home = p_model_ah_away = None
+                try:
+                    inv_h = 1.0 / float(ah_oh)
+                    inv_a = 1.0 / float(ah_oa)
+                    total_inv = float(ah_overround) if ah_overround else (inv_h + inv_a)
+                    if total_inv > 0:
+                        consensus_ah = {"home": inv_h / total_inv, "away": inv_a / total_inv}
+                except Exception:
+                    consensus_ah = {}
 
         cnts_ah = [int(c) for c in (ah_cnt_h, ah_cnt_a) if isinstance(c, (int, float)) and c > 0]
         min_cnt_ah = min(cnts_ah) if cnts_ah else None
@@ -1142,6 +1355,12 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=ah_oh,
+            model_prob=p_model_ah_home,
+            consensus_prob=consensus_ah.get("home") if consensus_ah else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
         )
         ev_ah_a, k_ah_a = apply_ev_filter(
             "ev_ah_away",
@@ -1155,6 +1374,12 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=ah_oa,
+            model_prob=p_model_ah_away,
+            consensus_prob=consensus_ah.get("away") if consensus_ah else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
         )
 
         if flag_map.get("ev_ah_home") in ("keep", "review"):
@@ -1171,6 +1396,8 @@ def main():
         crn_overround  = odds.get("crn_main_overround") or 9.9
 
         ev_crn_over = ev_crn_under = k_crn_over = k_crn_under = None
+        p_model_crn_over = p_model_crn_under = None
+        consensus_crn: Dict[str, float] = {}
         crn_totals_list: List[int] | None = None
 
         if crn_main_line is not None and crn_main_over is not None and crn_main_under is not None:
@@ -1183,8 +1410,20 @@ def main():
                 resC = ou_ev_kelly_from_totals_quarter(float(crn_main_line), float(crn_main_over), float(crn_main_under), crn_totals_list)
                 ev_crn_over, k_crn_over = resC["EV_over"],  resC["Kelly_over"]
                 ev_crn_under, k_crn_under = resC["EV_under"], resC["Kelly_under"]
+                p_model_crn_over = resC.get("p_over_success")
+                p_model_crn_under = resC.get("p_under_success")
                 if is_ev_outlier(max([x for x in (ev_crn_over,ev_crn_under) if x is not None], default=0)):
                     ev_crn_over = ev_crn_under = k_crn_over = k_crn_under = None
+                    p_model_crn_over = p_model_crn_under = None
+                else:
+                    try:
+                        inv_o = 1.0 / float(crn_main_over)
+                        inv_u = 1.0 / float(crn_main_under)
+                        total_inv = inv_o + inv_u
+                        if total_inv > 0:
+                            consensus_crn = {"over": inv_o / total_inv, "under": inv_u / total_inv}
+                    except Exception:
+                        consensus_crn = {}
 
         cnts_crn = [int(c) for c in (crn_cnt_o, crn_cnt_u) if isinstance(c, (int, float)) and c > 0]
         min_cnt_crn = min(cnts_crn) if cnts_crn else None
@@ -1202,6 +1441,12 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=crn_main_over,
+            model_prob=p_model_crn_over,
+            consensus_prob=consensus_crn.get("over") if consensus_crn else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
         )
         ev_crn_under, k_crn_under = apply_ev_filter(
             "ev_crn_main_under",
@@ -1215,6 +1460,12 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=crn_main_under,
+            model_prob=p_model_crn_under,
+            consensus_prob=consensus_crn.get("under") if consensus_crn else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
         )
 
         # ===== 全线榜单池 & 盘口矩阵（优先使用 *_lines；无则回退 _raw_*） =====
@@ -1408,6 +1659,33 @@ def main():
             row[f"flag_{key}"] = tag
         for key, reason in flag_reason_map.items():
             row[f"flag_reason_{key}"] = reason
+        for key, meta in ev_meta_map.items():
+            quality_f: float | None = None
+            ev_input_f: float | None = None
+            ev_cal_f: float | None = None
+            quality_val = meta.get("quality")
+            if quality_val is not None:
+                try:
+                    quality_f = float(quality_val)
+                    row[f"quality_{key}"] = round(quality_f, 4)
+                except (TypeError, ValueError):
+                    quality_f = None
+            ev_input_val = meta.get("ev_input")
+            if ev_input_val is not None:
+                try:
+                    ev_input_f = float(ev_input_val)
+                    row[f"ev_input_{key}"] = round(ev_input_f, 6)
+                except (TypeError, ValueError):
+                    ev_input_f = None
+            ev_cal_val = meta.get("ev_calibrated")
+            if ev_cal_val is not None:
+                try:
+                    ev_cal_f = float(ev_cal_val)
+                    row[f"ev_calibrated_{key}"] = round(ev_cal_f, 6)
+                except (TypeError, ValueError):
+                    ev_cal_f = None
+            if quality_f is not None and ev_input_f is not None:
+                row[f"score_{key}"] = round(quality_f * ev_input_f, 6)
 
         if lam_detail:
             row["lam_blend_detail"] = lam_detail
