@@ -3,7 +3,18 @@
 # 37号 · Value Engine —— 多模型融合 + 市场先验 + 四分盘 + 真实EV/Kelly + 质量工具
 
 import math
-import numpy as np
+try:
+    import numpy as np
+except ModuleNotFoundError:  # pragma: no cover - fallback for test environment
+    class _RandomStub:
+        @staticmethod
+        def seed(_seed):
+            return None
+
+    class _NumpyStub:
+        random = _RandomStub()
+
+    np = _NumpyStub()  # type: ignore
 from typing import Dict, Tuple
 
 OU_OR_MIN, OU_OR_MAX = 1.02, 1.18
@@ -52,6 +63,10 @@ MARKET_POLICIES = {
             "high_ev_min_bookmakers": 8,
             "high_ev_max_update": 5.0,
             "high_ev_min_vi": 0.02,
+            "quality_review": 0.6,
+            "quality_reject": 0.3,
+            "quality_target_bookmakers": 10,
+            "consensus_alpha": 0.2,
         },
         "ou": {
             "keep_min": 0.02,
@@ -64,6 +79,10 @@ MARKET_POLICIES = {
             "high_ev_min_bookmakers": 8,
             "high_ev_max_update": 5.0,
             "high_ev_min_vi": 0.02,
+            "quality_review": 0.6,
+            "quality_reject": 0.3,
+            "quality_target_bookmakers": 10,
+            "consensus_alpha": 0.2,
         },
         "ah": {
             "keep_min": 0.02,
@@ -76,6 +95,10 @@ MARKET_POLICIES = {
             "high_ev_min_bookmakers": 8,
             "high_ev_max_update": 5.0,
             "high_ev_min_vi": 0.02,
+            "quality_review": 0.6,
+            "quality_reject": 0.3,
+            "quality_target_bookmakers": 10,
+            "consensus_alpha": 0.2,
         },
         "derivative": {
             "keep_min": 0.05,
@@ -88,6 +111,10 @@ MARKET_POLICIES = {
             "high_ev_min_bookmakers": 8,
             "high_ev_max_update": 5.0,
             "high_ev_min_vi": 0.02,
+            "quality_review": 0.6,
+            "quality_reject": 0.3,
+            "quality_target_bookmakers": 10,
+            "consensus_alpha": 0.25,
         },
     },
     LEAGUE_TIER_OTHER: {
@@ -102,6 +129,10 @@ MARKET_POLICIES = {
             "high_ev_min_bookmakers": 8,
             "high_ev_max_update": 5.0,
             "high_ev_min_vi": 0.02,
+            "quality_review": 0.6,
+            "quality_reject": 0.3,
+            "quality_target_bookmakers": 12,
+            "consensus_alpha": 0.6,
         },
         "ou": {
             "keep_min": 0.04,
@@ -114,6 +145,10 @@ MARKET_POLICIES = {
             "high_ev_min_bookmakers": 8,
             "high_ev_max_update": 5.0,
             "high_ev_min_vi": 0.02,
+            "quality_review": 0.6,
+            "quality_reject": 0.3,
+            "quality_target_bookmakers": 12,
+            "consensus_alpha": 0.6,
         },
         "ah": {
             "keep_min": 0.04,
@@ -126,6 +161,10 @@ MARKET_POLICIES = {
             "high_ev_min_bookmakers": 8,
             "high_ev_max_update": 5.0,
             "high_ev_min_vi": 0.02,
+            "quality_review": 0.6,
+            "quality_reject": 0.3,
+            "quality_target_bookmakers": 12,
+            "consensus_alpha": 0.6,
         },
         "derivative": {
             "keep_min": 0.05,
@@ -138,6 +177,10 @@ MARKET_POLICIES = {
             "high_ev_min_bookmakers": 8,
             "high_ev_max_update": 5.0,
             "high_ev_min_vi": 0.02,
+            "quality_review": 0.6,
+            "quality_reject": 0.3,
+            "quality_target_bookmakers": 12,
+            "consensus_alpha": 0.65,
         },
     },
 }
@@ -175,6 +218,107 @@ def market_policy(tier: str, market: str) -> Dict[str, float]:
     return tier_policies.get(market, tier_policies.get("ou", {}))
 
 
+def _clamp01(value) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _score_bookmakers(count: float | None, minimum: int, target: float | None) -> float:
+    if count is None:
+        return 0.6
+    try:
+        cnt = float(count)
+    except (TypeError, ValueError):
+        return 0.6
+    min_req = max(1.0, float(minimum))
+    if cnt <= min_req:
+        return 0.65
+    tgt = float(target) if target and float(target) > min_req else min_req + 4.0
+    span = max(tgt - min_req, 1.0)
+    return 0.65 + 0.35 * _clamp01((cnt - min_req) / span)
+
+
+def _score_overround(overround: float | None, lo: float, hi: float) -> float:
+    if overround is None:
+        return 0.6
+    try:
+        val = float(overround)
+    except (TypeError, ValueError):
+        return 0.6
+    if val < lo or val > hi:
+        return 0.0
+    mid = (lo + hi) / 2.0
+    half_span = max((hi - lo) / 2.0, 1e-6)
+    dist = abs(val - mid)
+    ratio = min(1.0, dist / half_span)
+    return 0.6 + 0.4 * (1.0 - ratio)
+
+
+def _score_update_age(update_age: float | None, max_update: float) -> float:
+    if update_age is None:
+        return 0.75
+    try:
+        val = float(update_age)
+    except (TypeError, ValueError):
+        return 0.75
+    if val <= 0:
+        return 1.0
+    max_allow = max(float(max_update), 1e-6)
+    ratio = min(1.0, val / max_allow)
+    return 0.5 + 0.5 * (1.0 - ratio)
+
+
+def _score_data_quality(data_quality: float | None) -> float:
+    if data_quality is None:
+        return 0.7
+    return 0.4 + 0.6 * _clamp01(data_quality)
+
+
+def _score_sample_size(sample_size: float | None, target: float | None) -> float:
+    if sample_size is None:
+        return 0.7
+    try:
+        size = float(sample_size)
+    except (TypeError, ValueError):
+        return 0.7
+    tgt = max(float(target) if target else 50.0, 1.0)
+    return 0.5 + 0.5 * _clamp01(size / tgt)
+
+
+def compute_market_quality(
+    *,
+    min_bookmakers: float | None,
+    overround: float | None,
+    update_age: float | None,
+    policy: Dict[str, float],
+    data_quality: float | None = None,
+    sample_size: float | None = None,
+) -> tuple[float, tuple[str, ...]]:
+    min_req = int(policy.get("min_bookmakers", 6))
+    target_books = policy.get("quality_target_bookmakers", min_req + 4)
+    lo, hi = policy.get("overround_range", (1.02, 1.12))
+    max_update = float(policy.get("max_update_min", 10.0))
+    sample_target = policy.get("quality_sample_target")
+
+    components: list[tuple[str, float]] = []
+    components.append(("bookmakers", _score_bookmakers(min_bookmakers, min_req, target_books)))
+    components.append(("overround", _score_overround(overround, float(lo), float(hi))))
+    components.append(("stale", _score_update_age(update_age, max_update)))
+    if data_quality is not None:
+        components.append(("data", _score_data_quality(data_quality)))
+    if sample_size is not None:
+        components.append(("sample", _score_sample_size(sample_size, sample_target)))
+
+    if not components:
+        return 1.0, tuple()
+
+    quality = sum(score for _, score in components) / len(components)
+    flags = tuple(name for name, score in components if score < 0.55)
+    return _clamp01(quality), flags
+
+
 def value_index(ev: float | None, kelly: float | None) -> float | None:
     if ev is None or kelly is None:
         return None
@@ -197,8 +341,22 @@ def evaluate_ev_market(
     min_bookmakers: int | None = None,
     overround: float | None = None,
     update_age: float | None = None,
+    odds: float | None = None,
+    model_probability: float | None = None,
+    consensus_probability: float | None = None,
+    data_quality: float | None = None,
+    sample_size: float | None = None,
 ) -> Dict[str, object]:
-    result = {"ev": None, "kelly": None, "value_index": None, "tag": "invalid", "reasons": tuple()}
+    result = {
+        "ev": None,
+        "kelly": None,
+        "value_index": None,
+        "tag": "invalid",
+        "reasons": tuple(),
+        "quality": None,
+        "ev_input": None,
+        "ev_calibrated": None,
+    }
     if ev is None or kelly is None:
         return result
     try:
@@ -219,9 +377,12 @@ def evaluate_ev_market(
     keep_max = float(policy.get("keep_max", keep_min))
     drop = float(policy.get("drop", keep_max))
 
+    result["ev_input"] = ev_val
+
     if ev_val > drop:
         reason = f"ev>{drop:.1%}"
-        return {"ev": None, "kelly": None, "value_index": None, "tag": "reject", "reasons": (reason,)}
+        result.update({"tag": "reject", "reasons": (reason,)})
+        return result
 
     if ev_val < keep_min:
         tag = "low"
@@ -232,7 +393,7 @@ def evaluate_ev_market(
 
     min_req = int(policy.get("min_bookmakers", 6 if tier == LEAGUE_TIER_TOP else 8))
     reasons = []
-    if min_bookmakers is not None and min_bookmakers < min_req:
+    if min_bookmakers is None or min_bookmakers < min_req:
         reasons.append("bookmakers")
 
     try:
@@ -251,12 +412,84 @@ def evaluate_ev_market(
     if upd is not None and upd > max_update:
         reasons.append("stale")
 
-    if reasons:
-        return {"ev": None, "kelly": None, "value_index": None, "tag": "reject", "reasons": tuple(reasons)}
+    quality, quality_flags = compute_market_quality(
+        min_bookmakers=min_bookmakers,
+        overround=overround_val,
+        update_age=upd,
+        policy=policy,
+        data_quality=data_quality,
+        sample_size=sample_size,
+    )
+    result["quality"] = quality
 
-    vi = value_index(ev_val, kelly_val)
+    if reasons:
+        result.update({"tag": "reject", "reasons": tuple(reasons)})
+        return result
+
+    quality_reject = float(policy.get("quality_reject", 0.3))
+    if quality <= quality_reject:
+        reasons = tuple(sorted(set(quality_flags + ("quality",))))
+        result.update({"tag": "reject", "reasons": reasons})
+        return result
+
+    consensus_alpha = float(policy.get("consensus_alpha", 0.2 if tier == LEAGUE_TIER_TOP else 0.6))
+
+    ev_calibrated = ev_val
+    odds_val = None
+    try:
+        if odds is not None:
+            odds_val = float(odds)
+            if odds_val <= 1.0:
+                odds_val = None
+    except (TypeError, ValueError):
+        odds_val = None
+
+    model_p = _clamp01(model_probability) if model_probability is not None else None
+    consensus_p = _clamp01(consensus_probability) if consensus_probability is not None else None
+
+    if odds_val is not None and model_p is not None:
+        blend_p = model_p
+        if consensus_p is not None:
+            blend_p = _clamp01((1.0 - consensus_alpha) * model_p + consensus_alpha * consensus_p)
+            ev_consensus = consensus_p * odds_val - 1.0
+            ev_candidate = (1.0 - consensus_alpha) * ev_val + consensus_alpha * ev_consensus
+            ev_calibrated = min(ev_val, ev_candidate)
+        b = odds_val - 1.0
+        if b > 0:
+            kelly_from_blend = max(0.0, (blend_p * odds_val - 1.0) / b)
+            kelly_val = min(kelly_val, kelly_from_blend)
+    elif odds_val is not None and consensus_p is not None:
+        ev_consensus = consensus_p * odds_val - 1.0
+        ev_calibrated = min(ev_val, (1.0 - consensus_alpha) * ev_val + consensus_alpha * ev_consensus)
+
+    result["ev_calibrated"] = ev_calibrated
+
+    ev_penalized = ev_calibrated * quality
+    kelly_val = max(0.0, min(kelly_val, kelly_val * quality))
+
+    if kelly_val <= 0:
+        result.update({"tag": "reject", "reasons": ("kelly",)})
+        return result
+
+    if ev_penalized > drop:
+        reason = f"ev>{drop:.1%}"
+        result.update({"tag": "reject", "reasons": (reason,)})
+        return result
+
+    if ev_penalized < keep_min:
+        tag = "low"
+    elif ev_penalized <= keep_max:
+        tag = "keep"
+    else:
+        tag = "review"
+
+    quality_review = float(policy.get("quality_review", 0.6))
+    if quality < quality_review and tag == "keep":
+        tag = "review"
+
+    vi = value_index(ev_penalized, kelly_val)
     high_ev_cut = policy.get("high_ev_review")
-    if high_ev_cut is not None and ev_val > float(high_ev_cut):
+    if high_ev_cut is not None and ev_penalized > float(high_ev_cut):
         guard_reasons = []
         guard_books = int(policy.get("high_ev_min_bookmakers", min_req))
         if min_bookmakers is None or min_bookmakers < guard_books:
@@ -268,14 +501,18 @@ def evaluate_ev_market(
         if vi is None or vi < guard_vi:
             guard_reasons.append("hi_ev_vi")
         if guard_reasons:
-            return {"ev": None, "kelly": None, "value_index": None, "tag": "reject", "reasons": tuple(guard_reasons)}
+            result.update({"tag": "reject", "reasons": tuple(guard_reasons)})
+            return result
 
     return {
-        "ev": round(ev_val, 6),
+        "ev": round(ev_penalized, 6),
         "kelly": round(kelly_val, 6),
         "value_index": vi,
         "tag": tag,
         "reasons": tuple(),
+        "quality": quality,
+        "ev_input": ev_val,
+        "ev_calibrated": ev_calibrated,
     }
 
 def set_seed(seed: int | None):
