@@ -18,6 +18,12 @@ def test_evaluate_rejects_insufficient_bookmakers() -> None:
     assert res["ev"] is None
     assert res["tag"] == "reject"
     assert "bookmakers" in res.get("reasons", ())
+    thresholds = res.get("thresholds")
+    assert isinstance(thresholds, dict)
+    assert math.isclose(float(thresholds["keep_min"]), 0.02, rel_tol=1e-9)
+    assert math.isclose(float(thresholds["keep_max"]), 0.06, rel_tol=1e-9)
+    assert math.isclose(float(thresholds["drop"]), 0.12, rel_tol=1e-9)
+    assert math.isclose(float(thresholds["min_bookmakers"]), 6.0, rel_tol=1e-9)
 
 
 def test_consensus_shrinks_ev_for_top_tier() -> None:
@@ -37,6 +43,10 @@ def test_consensus_shrinks_ev_for_top_tier() -> None:
     assert math.isclose(res["ev_input"], 0.12, rel_tol=1e-9)
     assert res["ev"] < res["ev_input"]
     assert res["quality"] is not None and 0 < res["quality"] <= 1
+    thresholds = res.get("thresholds")
+    assert isinstance(thresholds, dict)
+    assert math.isclose(float(thresholds["consensus_alpha"]), 0.2, rel_tol=1e-9)
+    assert math.isclose(float(thresholds["kelly_cap"]), 0.08, rel_tol=1e-9)
 
 
 def test_quality_penalty_reduces_ev() -> None:
@@ -58,3 +68,7 @@ def test_quality_penalty_reduces_ev() -> None:
     assert res["ev_calibrated"] is not None
     assert res["quality"] is not None and res["quality"] < 1.0
     assert res["ev"] < res["ev_calibrated"]
+    thresholds = res.get("thresholds")
+    assert isinstance(thresholds, dict)
+    assert math.isclose(float(thresholds["quality_reject"]), 0.3, rel_tol=1e-9)
+    assert math.isclose(float(thresholds["quality_review"]), 0.6, rel_tol=1e-9)
