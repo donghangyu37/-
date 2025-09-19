@@ -15,7 +15,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for test environment
         random = _RandomStub()
 
     np = _NumpyStub()  # type: ignore
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 OU_OR_MIN, OU_OR_MAX = 1.02, 1.18
 X1X2_OR_MIN, X1X2_OR_MAX = 1.02, 1.20
@@ -347,7 +347,7 @@ def evaluate_ev_market(
     data_quality: float | None = None,
     sample_size: float | None = None,
 ) -> Dict[str, object]:
-    result = {
+    result: Dict[str, Any] = {
         "ev": None,
         "kelly": None,
         "value_index": None,
@@ -356,6 +356,7 @@ def evaluate_ev_market(
         "quality": None,
         "ev_input": None,
         "ev_calibrated": None,
+        "thresholds": {},
     }
     if ev is None or kelly is None:
         return result
@@ -377,6 +378,52 @@ def evaluate_ev_market(
     keep_max = float(policy.get("keep_max", keep_min))
     drop = float(policy.get("drop", keep_max))
 
+    def _to_float(value) -> float | None:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    min_req = int(policy.get("min_bookmakers", 6 if tier == LEAGUE_TIER_TOP else 8))
+    try:
+        or_range = policy.get("overround_range", (1.02, 1.12))
+        lo, hi = float(or_range[0]), float(or_range[1])
+    except Exception:
+        lo, hi = 1.02, 1.12
+    max_update = float(policy.get("max_update_min", 10.0))
+    quality_review_threshold = float(policy.get("quality_review", 0.6))
+    quality_reject_threshold = float(policy.get("quality_reject", 0.3))
+    consensus_alpha = float(policy.get("consensus_alpha", 0.2 if tier == LEAGUE_TIER_TOP else 0.6))
+
+    thresholds = {
+        "keep_min": keep_min,
+        "keep_max": keep_max,
+        "drop": drop,
+        "min_bookmakers": float(min_req),
+        "overround_min": lo,
+        "overround_max": hi,
+        "max_update_min": max_update,
+        "quality_review": quality_review_threshold,
+        "quality_reject": quality_reject_threshold,
+        "consensus_alpha": consensus_alpha,
+        "kelly_cap": cap,
+    }
+    high_ev_review = _to_float(policy.get("high_ev_review"))
+    if high_ev_review is not None:
+        thresholds["high_ev_review"] = high_ev_review
+    high_ev_min_books = _to_float(policy.get("high_ev_min_bookmakers"))
+    if high_ev_min_books is not None:
+        thresholds["high_ev_min_bookmakers"] = high_ev_min_books
+    high_ev_max_update = _to_float(policy.get("high_ev_max_update"))
+    if high_ev_max_update is not None:
+        thresholds["high_ev_max_update"] = high_ev_max_update
+    high_ev_min_vi = _to_float(policy.get("high_ev_min_vi"))
+    if high_ev_min_vi is not None:
+        thresholds["high_ev_min_vi"] = high_ev_min_vi
+
+    result["thresholds"] = thresholds
     result["ev_input"] = ev_val
 
     if ev_val > drop:
@@ -391,7 +438,6 @@ def evaluate_ev_market(
     else:
         tag = "review"
 
-    min_req = int(policy.get("min_bookmakers", 6 if tier == LEAGUE_TIER_TOP else 8))
     reasons = []
     if min_bookmakers is None or min_bookmakers < min_req:
         reasons.append("bookmakers")
@@ -400,7 +446,6 @@ def evaluate_ev_market(
         overround_val = float(overround) if overround is not None else None
     except (TypeError, ValueError):
         overround_val = None
-    lo, hi = policy.get("overround_range", (1.02, 1.12))
     if overround_val is not None and not (lo <= overround_val <= hi):
         reasons.append("overround")
 
@@ -408,7 +453,6 @@ def evaluate_ev_market(
         upd = float(update_age) if update_age is not None else None
     except (TypeError, ValueError):
         upd = None
-    max_update = float(policy.get("max_update_min", 10.0))
     if upd is not None and upd > max_update:
         reasons.append("stale")
 
@@ -426,13 +470,10 @@ def evaluate_ev_market(
         result.update({"tag": "reject", "reasons": tuple(reasons)})
         return result
 
-    quality_reject = float(policy.get("quality_reject", 0.3))
-    if quality <= quality_reject:
+    if quality <= quality_reject_threshold:
         reasons = tuple(sorted(set(quality_flags + ("quality",))))
         result.update({"tag": "reject", "reasons": reasons})
         return result
-
-    consensus_alpha = float(policy.get("consensus_alpha", 0.2 if tier == LEAGUE_TIER_TOP else 0.6))
 
     ev_calibrated = ev_val
     odds_val = None
@@ -483,8 +524,7 @@ def evaluate_ev_market(
     else:
         tag = "review"
 
-    quality_review = float(policy.get("quality_review", 0.6))
-    if quality < quality_review and tag == "keep":
+    if quality < quality_review_threshold and tag == "keep":
         tag = "review"
 
     vi = value_index(ev_penalized, kelly_val)
@@ -504,16 +544,19 @@ def evaluate_ev_market(
             result.update({"tag": "reject", "reasons": tuple(guard_reasons)})
             return result
 
-    return {
-        "ev": round(ev_penalized, 6),
-        "kelly": round(kelly_val, 6),
-        "value_index": vi,
-        "tag": tag,
-        "reasons": tuple(),
-        "quality": quality,
-        "ev_input": ev_val,
-        "ev_calibrated": ev_calibrated,
-    }
+    result.update(
+        {
+            "ev": round(ev_penalized, 6),
+            "kelly": round(kelly_val, 6),
+            "value_index": vi,
+            "tag": tag,
+            "reasons": tuple(),
+            "quality": quality,
+            "ev_input": ev_val,
+            "ev_calibrated": ev_calibrated,
+        }
+    )
+    return result
 
 def set_seed(seed: int | None):
     if seed is None:

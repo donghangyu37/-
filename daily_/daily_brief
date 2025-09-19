@@ -149,7 +149,7 @@ def apply_ev_filter(
     flag_map: Dict[str, str],
     reason_map: Dict[str, str],
     vi_map: Dict[str, float | None],
-    meta_map: Dict[str, Dict[str, float | str]] | None = None,
+    meta_map: Dict[str, Dict[str, object]] | None = None,
     odds: float | None = None,
     model_prob: float | None = None,
     consensus_prob: float | None = None,
@@ -182,7 +182,8 @@ def apply_ev_filter(
         reason_map[key] = ",".join(str(r) for r in reasons)
     vi_map[key] = res.get("value_index")
     if meta_map is not None:
-        meta_entry: Dict[str, float | str] = {}
+        diagnostics = meta_map.setdefault("diagnostics", {})
+        meta_entry: Dict[str, object] = {}
         quality = res.get("quality")
         if quality is not None:
             try:
@@ -201,8 +202,11 @@ def apply_ev_filter(
                 meta_entry["ev_calibrated"] = round(float(ev_cal), 6)
             except (TypeError, ValueError):
                 pass
+        thresholds = res.get("thresholds")
+        if isinstance(thresholds, dict) and thresholds:
+            meta_entry["thresholds"] = thresholds
         if meta_entry:
-            meta_map[key] = meta_entry
+            diagnostics[key] = meta_entry
     return res.get("ev"), res.get("kelly")
 
 # ===== 四分之一盘精结算（基于 totals 样本）=====
@@ -1051,7 +1055,7 @@ def main():
         flag_map: Dict[str, str] = {}
         flag_reason_map: Dict[str, str] = {}
         vi_map: Dict[str, float | None] = {}
-        ev_meta_map: Dict[str, Dict[str, float | str]] = {}
+        ev_meta_map: Dict[str, Dict[str, object]] = {}
 
         # ===== 1X2 =====
         o1_h,o1_d,o1_a = odds.get("1x2_home"),odds.get("1x2_draw"),odds.get("1x2_away")
@@ -1659,7 +1663,15 @@ def main():
             row[f"flag_{key}"] = tag
         for key, reason in flag_reason_map.items():
             row[f"flag_reason_{key}"] = reason
-        for key, meta in ev_meta_map.items():
+        diagnostics_src = ev_meta_map.get("diagnostics")
+        if isinstance(diagnostics_src, dict):
+            diagnostics_items = diagnostics_src.items()
+        else:
+            diagnostics_items = ((k, v) for k, v in ev_meta_map.items() if k != "diagnostics")
+
+        for key, meta in diagnostics_items:
+            if not isinstance(meta, dict):
+                continue
             quality_f: float | None = None
             ev_input_f: float | None = None
             ev_cal_f: float | None = None
@@ -1684,6 +1696,26 @@ def main():
                     row[f"ev_calibrated_{key}"] = round(ev_cal_f, 6)
                 except (TypeError, ValueError):
                     ev_cal_f = None
+            thresholds = meta.get("thresholds")
+            if isinstance(thresholds, dict):
+                keep_min_val = thresholds.get("keep_min")
+                keep_max_val = thresholds.get("keep_max")
+                drop_val = thresholds.get("drop")
+                if keep_min_val is not None:
+                    try:
+                        row[f"threshold_keep_min_{key}"] = round(float(keep_min_val), 4)
+                    except (TypeError, ValueError):
+                        pass
+                if keep_max_val is not None:
+                    try:
+                        row[f"threshold_keep_max_{key}"] = round(float(keep_max_val), 4)
+                    except (TypeError, ValueError):
+                        pass
+                if drop_val is not None:
+                    try:
+                        row[f"threshold_drop_{key}"] = round(float(drop_val), 4)
+                    except (TypeError, ValueError):
+                        pass
             if quality_f is not None and ev_input_f is not None:
                 row[f"score_{key}"] = round(quality_f * ev_input_f, 6)
 
