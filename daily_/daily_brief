@@ -2,7 +2,8 @@
 from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional, Set
-import math, os, csv, traceback, random
+from collections import Counter, defaultdict
+import math, os, csv, traceback, random, re
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
@@ -93,8 +94,8 @@ LOG_LAMBDA_BLEND = _env_int("LAM_LOG_BLEND", 1)
 # ===== Picks 导出配置 =====
 EXPORT_PICKS = 1
 PICKS_TOP_N = 100
-PICKS_MIN_EV = 0.05
-PICKS_MIN_KELLY = 0.05
+PICKS_MIN_EV = 0.015
+PICKS_MIN_KELLY = 0.02
 PICKS_MIN_VI = 0.00
 KELLY_FRACTION = 0.25
 STAKE_CAP_PCT = 2.0
@@ -112,6 +113,36 @@ def sanitize_ou_pair(o_over: float | None, o_under: float | None) -> Tuple[float
     imp = 1/oo + 1/uu
     if not (1.00 <= imp <= 1.25): return None
     return oo, uu
+
+
+def _consensus_line(lines: dict, *, market: str) -> Optional[float]:
+    if not isinstance(lines, dict):
+        return None
+    best_line: Optional[float] = None
+    best_score = -1.0
+    for raw_line, info in lines.items():
+        try:
+            line = float(raw_line)
+        except Exception:
+            continue
+        data = info or {}
+        if market == "ou":
+            weight = float(data.get("over_cnt", 0) or 0) + float(data.get("under_cnt", 0) or 0)
+        else:
+            weight = float(data.get("home_cnt", 0) or 0) + float(data.get("away_cnt", 0) or 0)
+        if weight > best_score:
+            best_score = weight
+            best_line = line
+    return best_line
+
+
+def _line_matches_consensus(line: float | None, consensus: float | None, tolerance: float = 0.25) -> bool:
+    if line is None or consensus is None:
+        return True
+    try:
+        return abs(float(line) - float(consensus)) <= float(tolerance) + 1e-6
+    except Exception:
+        return True
 
 def sanitize_1x2(o_h: float | None, o_d: float | None, o_a: float | None):
     try:
@@ -149,10 +180,57 @@ def apply_ev_filter(
     flag_map: Dict[str, str],
     reason_map: Dict[str, str],
     vi_map: Dict[str, float | None],
+    meta_map: Dict[str, Dict[str, float | str]] | None = None,
+    odds: float | None = None,
+    model_prob: float | None = None,
+    consensus_prob: float | None = None,
+    data_quality: float | None = None,
+    sample_size: float | None = None,
+
+    diagnostics: Dict[str, dict] | None = None,
+    diag_key: str | None = None,
+    pre_tag: str | None = None,
+    pre_reasons: Tuple[str, ...] | None = None,
 ) -> tuple[float | None, float | None]:
+    diag_label = diag_key or key
+    diag_entry = None
+    if diagnostics is not None and diag_label:
+        diag_entry = diagnostics.setdefault(
+            diag_label,
+            {
+                "seen": 0,
+                "ev_inputs": 0,
+                "tags": Counter(),
+                "reasons": defaultdict(Counter),
+                "ev_sum": defaultdict(float),
+                "ev_count": defaultdict(int),
+                "kelly_sum": defaultdict(float),
+                "kelly_count": defaultdict(int),
+            },
+        )
+        diag_entry["seen"] += 1
+        if ev is not None and kelly is not None:
+            diag_entry["ev_inputs"] += 1
+
+    if pre_tag:
+        flag_map[key] = pre_tag
+        if pre_reasons:
+            reason_map[key] = ",".join(sorted(set(str(r) for r in pre_reasons)))
+        vi_map[key] = None
+        if diag_entry is not None:
+            diag_entry["tags"][pre_tag] += 1
+            if pre_reasons:
+                diag_entry["reasons"][pre_tag].update(pre_reasons)
+        return None, None
+
     if ev is None or kelly is None:
+        reasons = tuple(pre_reasons) if pre_reasons else ("no_ev",)
+        reason_map[key] = ",".join(sorted(set(str(r) for r in reasons)))
         flag_map[key] = "invalid"
         vi_map[key] = None
+        if diag_entry is not None:
+            diag_entry["tags"]["invalid"] += 1
+            diag_entry["reasons"]["invalid"].update(reasons)
         return None, None
 
     res = evaluate_ev_market(
@@ -163,6 +241,11 @@ def apply_ev_filter(
         min_bookmakers=min_bookmakers,
         overround=overround,
         update_age=update_age,
+        odds=odds,
+        model_probability=model_prob,
+        consensus_probability=consensus_prob,
+        data_quality=data_quality,
+        sample_size=sample_size,
     )
     flag = res.get("tag", "invalid")
     flag_map[key] = flag
@@ -170,6 +253,76 @@ def apply_ev_filter(
     if reasons:
         reason_map[key] = ",".join(str(r) for r in reasons)
     vi_map[key] = res.get("value_index")
+    if diag_entry is not None:
+        diag_entry["tags"][flag] += 1
+        if reasons:
+            diag_entry["reasons"][flag].update(reasons)
+        ev_out = res.get("ev")
+        if isinstance(ev_out, (int, float)):
+            diag_entry["ev_sum"][flag] += float(ev_out)
+            diag_entry["ev_count"][flag] += 1
+        k_out = res.get("kelly")
+        if isinstance(k_out, (int, float)):
+            diag_entry["kelly_sum"][flag] += float(k_out)
+            diag_entry["kelly_count"][flag] += 1
+    if meta_map is not None:
+        meta_entry: Dict[str, float | str] = {}
+        quality = res.get("quality")
+        if quality is not None:
+            try:
+                meta_entry["quality"] = round(float(quality), 6)
+            except (TypeError, ValueError):
+                pass
+        ev_input = res.get("ev_input")
+        if ev_input is not None:
+            try:
+                meta_entry["ev_input"] = round(float(ev_input), 6)
+            except (TypeError, ValueError):
+                pass
+        ev_cal = res.get("ev_calibrated")
+        if ev_cal is not None:
+            try:
+                meta_entry["ev_calibrated"] = round(float(ev_cal), 6)
+            except (TypeError, ValueError):
+                pass
+        liquidity = res.get("liquidity")
+        if liquidity is not None:
+            try:
+                meta_entry["liquidity"] = round(float(liquidity), 6)
+            except (TypeError, ValueError):
+                pass
+        score = res.get("score")
+        if score is not None:
+            try:
+                meta_entry["score"] = round(float(score), 6)
+            except (TypeError, ValueError):
+                pass
+        k_full = res.get("kelly_full")
+        if k_full is not None:
+            try:
+                meta_entry["kelly_full"] = round(float(k_full), 6)
+            except (TypeError, ValueError):
+                pass
+        for meta_key in (
+            "threshold_score_keep",
+            "threshold_score_review",
+            "threshold_quality_keep",
+            "threshold_quality_reject",
+            "threshold_liquidity_keep",
+            "threshold_kelly_keep",
+            "threshold_ev_keep_min",
+            "threshold_ev_keep_max",
+            "threshold_ev_drop",
+        ):
+            val = res.get(meta_key)
+            if val is None:
+                continue
+            try:
+                meta_entry[meta_key] = round(float(val), 6)
+            except (TypeError, ValueError):
+                continue
+        if meta_entry:
+            meta_map[key] = meta_entry
     return res.get("ev"), res.get("kelly")
 
 # ===== 四分之一盘精结算（基于 totals 样本）=====
@@ -256,8 +409,26 @@ def ou_ev_kelly_from_totals_quarter(line: float, over_odds: float, under_odds: f
     K_over  = 0.0 if b_over  <= 0 else max(0.0, (b_over*pwin_o  - plose_o)/b_over)
     K_under = 0.0 if b_under <= 0 else max(0.0, (b_under*pwin_u - plose_u)/b_under)
 
-    return {"EV_over": float(EV_over), "Kelly_over": float(K_over),
-            "EV_under": float(EV_under), "Kelly_under": float(K_under)}
+    return {
+        "EV_over": float(EV_over),
+        "Kelly_over": float(K_over),
+        "EV_under": float(EV_under),
+        "Kelly_under": float(K_under),
+        "p_over_full_win": float(fw_o),
+        "p_over_half_win": float(hw_o),
+        "p_over_push": float(pu_o),
+        "p_over_half_loss": float(hl_o),
+        "p_over_full_loss": float(fl_o),
+        "p_under_full_win": float(fw_u),
+        "p_under_half_win": float(hw_u),
+        "p_under_push": float(pu_u),
+        "p_under_half_loss": float(hl_u),
+        "p_under_full_loss": float(fl_u),
+        "p_over_success": float(pwin_o),
+        "p_over_negative": float(plose_o),
+        "p_under_success": float(pwin_u),
+        "p_under_negative": float(plose_u),
+    }
 
 def _regression_check_quarter_under() -> None:
     """Verify under-quarter lines treat integer totals as half wins."""
@@ -572,7 +743,74 @@ def compute_lambda_models(
                 print(f"[λ模型] 近况模型计算失败 {home_id}-{away_id}: {e}")
     return models
 
-def blend_lambda_models(models: Dict[str, dict], config: Dict[str, dict]) -> tuple[float, float, Dict[str, float]]:
+def _extract_matches_played(stats: dict, *, location: str) -> float:
+    fixtures = (stats or {}).get("fixtures") or {}
+    played = fixtures.get("played") or fixtures.get("total") or {}
+    candidates: List[float | None] = []
+    if isinstance(played, dict):
+        if location == "home":
+            candidates.extend([played.get("home"), played.get("overall"), played.get("total")])
+        else:
+            candidates.extend([played.get("away"), played.get("overall"), played.get("total")])
+    else:
+        candidates.append(_to_float(played, default=None))
+    candidates.append(_to_float((stats or {}).get("matches_played"), default=None))
+    for val in candidates:
+        try:
+            if val is None:
+                continue
+            num = float(val)
+            if num > 0:
+                return num
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _stabilize_lambdas(
+    lam_home: float,
+    lam_away: float,
+    *,
+    league_avg: float,
+    league_tier: str,
+    home_stats: dict,
+    away_stats: dict,
+) -> tuple[float, float]:
+    base_home, base_away = expected_goals_from_strengths(1.0, 1.0, 1.0, 1.0, league_avg, HOME_ADV)
+    home_matches = _extract_matches_played(home_stats, location="home")
+    away_matches = _extract_matches_played(away_stats, location="away")
+    w_home = min(1.0, home_matches / 12.0) if home_matches else 0.0
+    w_away = min(1.0, away_matches / 12.0) if away_matches else 0.0
+    lam_home = w_home * float(lam_home) + (1.0 - w_home) * float(base_home)
+    lam_away = w_away * float(lam_away) + (1.0 - w_away) * float(base_away)
+    total = lam_home + lam_away
+    if total > 0:
+        scale = float(league_avg) / total
+        lam_home *= scale
+        lam_away *= scale
+    if league_tier == LEAGUE_TIER_TOP:
+        bounds = (0.6, 2.8)
+    else:
+        bounds = (0.5, 3.2)
+    lam_home = min(bounds[1], max(bounds[0], lam_home))
+    lam_away = min(bounds[1], max(bounds[0], lam_away))
+    total = lam_home + lam_away
+    if total > 0:
+        scale = float(league_avg) / total
+        lam_home *= scale
+        lam_away *= scale
+    return float(lam_home), float(lam_away)
+
+
+def blend_lambda_models(
+    models: Dict[str, dict],
+    config: Dict[str, dict],
+    *,
+    league_avg: float,
+    league_tier: str,
+    home_stats: dict,
+    away_stats: dict,
+) -> tuple[float, float, Dict[str, float]]:
     valid = {
         name: data
         for name, data in models.items()
@@ -602,6 +840,14 @@ def blend_lambda_models(models: Dict[str, dict], config: Dict[str, dict]) -> tup
     total_weight = sum(weights_used.values()) or 1.0
     lam_home = weighted_home / total_weight
     lam_away = weighted_away / total_weight
+    lam_home, lam_away = _stabilize_lambdas(
+        lam_home,
+        lam_away,
+        league_avg=league_avg,
+        league_tier=league_tier,
+        home_stats=home_stats,
+        away_stats=away_stats,
+    )
     normalized = {name: (weights_used.get(name, 0.0) / total_weight) for name in valid}
     return float(lam_home), float(lam_away), normalized
 
@@ -663,22 +909,110 @@ def _stake_pct_from_kelly(k: Optional[float]) -> float:
 
 def export_picks(rows_all: List[Dict], date_str: str):
     picks: List[Dict] = []
+
+    def _with_quality(payload: Dict, row: Dict, key: str) -> Dict:
+        out = dict(payload)
+        quality_val = row.get(f"quality_{key}")
+        if quality_val is not None:
+            try:
+                out["quality"] = float(quality_val)
+            except (TypeError, ValueError):
+                pass
+        ev_input_val = row.get(f"ev_input_{key}")
+        if ev_input_val is not None:
+            try:
+                out["ev_input"] = float(ev_input_val)
+            except (TypeError, ValueError):
+                pass
+        ev_cal_val = row.get(f"ev_calibrated_{key}")
+        if ev_cal_val is not None:
+            try:
+                out["ev_calibrated"] = float(ev_cal_val)
+            except (TypeError, ValueError):
+                pass
+        score_val = row.get(f"score_{key}")
+        if score_val is not None:
+            try:
+                out["score"] = float(score_val)
+            except (TypeError, ValueError):
+                pass
+        liquidity_val = row.get(f"liquidity_{key}")
+        if liquidity_val is not None:
+            try:
+                out["liquidity"] = float(liquidity_val)
+            except (TypeError, ValueError):
+                pass
+        k_full_val = row.get(f"kelly_full_{key}")
+        if k_full_val is not None:
+            try:
+                out["kelly_full"] = float(k_full_val)
+            except (TypeError, ValueError):
+                pass
+        for t_key in (
+            "threshold_score_keep",
+            "threshold_quality_keep",
+            "threshold_liquidity_keep",
+            "threshold_kelly_keep",
+        ):
+            t_val = row.get(f"{t_key}_{key}")
+            if t_val is None:
+                continue
+            try:
+                out[t_key] = float(t_val)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _passes_gates(row: Dict, key: str) -> bool:
+        try:
+            score = float(row.get(f"score_{key}"))
+            quality = float(row.get(f"quality_{key}"))
+            liquidity = float(row.get(f"liquidity_{key}"))
+            k_full = float(row.get(f"kelly_full_{key}"))
+        except (TypeError, ValueError):
+            return False
+        def _threshold(field: str, default: float) -> float:
+            raw = row.get(f"{field}_{key}")
+            try:
+                return float(raw) if raw is not None else default
+            except (TypeError, ValueError):
+                return default
+
+        score_keep = _threshold("threshold_score_keep", 0.06)
+        quality_keep = _threshold("threshold_quality_keep", 0.78)
+        liquidity_keep = _threshold("threshold_liquidity_keep", 0.9)
+        kelly_keep = _threshold("threshold_kelly_keep", 0.02)
+
+        if score < score_keep:
+            return False
+        if quality < quality_keep:
+            return False
+        if liquidity < liquidity_keep:
+            return False
+        if k_full < kelly_keep:
+            return False
+        return True
+
     for r in rows_all:
         base = {"date_utc": r.get("date_utc"), "kickoff_utc": r.get("kickoff_utc"),
                 "league": r.get("league"), "home": r.get("home"), "away": r.get("away")}
         # Goals OU 主盘
         ev, k = r.get("ev_ou_main_over"), r.get("kelly_ou_main_over")
         if ev is not None and k is not None and r.get("flag_ev_ou_main_over") == "keep":
-            vi = value_index(ev, k)
-            if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                picks.append({**base, "market":"OU-Over", "book":_fmt_ou_book(r.get("ou_main_line"), r.get("odds_ou_main_over"), False),
-                              "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)})
+            if _passes_gates(r, "ev_ou_main_over"):
+                vi = value_index(ev, k)
+                if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
+                    payload = {**base, "market":"OU-Over", "book":_fmt_ou_book(r.get("ou_main_line"), r.get("odds_ou_main_over"), False),
+                               "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)}
+                    picks.append(_with_quality(payload, r, "ev_ou_main_over"))
         ev, k = r.get("ev_ou_main_under"), r.get("kelly_ou_main_under")
         if ev is not None and k is not None and r.get("flag_ev_ou_main_under") == "keep":
-            vi = value_index(ev, k)
-            if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                picks.append({**base, "market":"OU-Under", "book":_fmt_ou_book(r.get("ou_main_line"), r.get("odds_ou_main_under"), False),
-                              "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)})
+            if _passes_gates(r, "ev_ou_main_under"):
+                vi = value_index(ev, k)
+                if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
+                    payload = {**base, "market":"OU-Under", "book":_fmt_ou_book(r.get("ou_main_line"), r.get("odds_ou_main_under"), False),
+                               "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)}
+                    picks.append(_with_quality(payload, r, "ev_ou_main_under"))
         # 1X2
         for mk, evk, kel, odd in [
             ("1X2-Home", r.get("ev_1x2_home"), r.get("kelly_1x2_home"), r.get("odds_1x2_home")),
@@ -687,10 +1021,14 @@ def export_picks(rows_all: List[Dict], date_str: str):
         ]:
             flag_key = f"flag_{'ev_1x2_home' if mk=='1X2-Home' else 'ev_1x2_draw' if mk=='1X2-Draw' else 'ev_1x2_away'}"
             if evk is not None and kel is not None and odd is not None and r.get(flag_key) == "keep":
+                row_key = "ev_1x2_home" if mk == "1X2-Home" else "ev_1x2_draw" if mk == "1X2-Draw" else "ev_1x2_away"
+                if not _passes_gates(r, row_key):
+                    continue
                 vi = value_index(evk, kel)
                 if evk>=PICKS_MIN_EV and kel>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                    picks.append({**base, "market":mk, "book":f"{mk}@{float(odd):.2f}",
-                                  "ev":float(evk),"kelly":float(kel),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(kel)})
+                    payload = {**base, "market":mk, "book":f"{mk}@{float(odd):.2f}",
+                               "ev":float(evk),"kelly":float(kel),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(kel)}
+                    picks.append(_with_quality(payload, r, row_key))
         # AH 主盘
         ah_line = r.get("ah_line")
         if ah_line is not None:
@@ -700,24 +1038,15 @@ def export_picks(rows_all: List[Dict], date_str: str):
             ]:
                 flag_key = f"flag_ev_ah_{side}"
                 if evk is not None and kel is not None and odd is not None and r.get(flag_key) == "keep":
+                    row_key = f"ev_ah_{side}"
+                    if not _passes_gates(r, row_key):
+                        continue
                     vi = value_index(evk, kel)
                     if evk>=PICKS_MIN_EV and kel>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                        picks.append({**base, "market":f"AH-{'Home' if side=='home' else 'Away'}",
-                                      "book":_fmt_ah_book(ah_line, odd, side),
-                                      "ev":float(evk),"kelly":float(kel),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(kel)})
-        # 角球 OU 主盘
-        ev, k = r.get("ev_crn_main_over"), r.get("kelly_crn_main_over")
-        if ev is not None and k is not None and r.get("flag_ev_crn_main_over") == "keep":
-            vi = value_index(ev, k)
-            if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                picks.append({**base,"market":"CRN-Over","book":_fmt_ou_book(r.get("crn_main_line"), r.get("odds_crn_main_over"), True),
-                              "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)})
-        ev, k = r.get("ev_crn_main_under"), r.get("kelly_crn_main_under")
-        if ev is not None and k is not None and r.get("flag_ev_crn_main_under") == "keep":
-            vi = value_index(ev, k)
-            if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                picks.append({**base,"market":"CRN-Under","book":_fmt_ou_book(r.get("crn_main_line"), r.get("odds_crn_main_under"), True),
-                              "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)})
+                        payload = {**base, "market":f"AH-{'Home' if side=='home' else 'Away'}",
+                                   "book":_fmt_ah_book(ah_line, odd, side),
+                                   "ev":float(evk),"kelly":float(kel),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(kel)}
+                        picks.append(_with_quality(payload, r, row_key))
 
     picks.sort(key=lambda x: x.get("value_index", -999), reverse=True)
     if PICKS_TOP_N is not None:
@@ -725,10 +1054,120 @@ def export_picks(rows_all: List[Dict], date_str: str):
 
     out_dir = os.path.join(os.getcwd(), "out"); os.makedirs(out_dir, exist_ok=True)
     out_file = os.path.join(out_dir, f"picks_{date_str}.csv")
-    fieldnames = ["date_utc","kickoff_utc","league","home","away","market","book","ev","kelly","value_index","stake_pct"]
+    fieldnames = [
+        "date_utc","kickoff_utc","league","home","away","market","book",
+        "ev","kelly","value_index","stake_pct","quality","liquidity","kelly_full","ev_input","ev_calibrated","score",
+        "threshold_score_keep","threshold_quality_keep","threshold_liquidity_keep","threshold_kelly_keep"
+    ]
     with open(out_file, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames); w.writeheader(); [w.writerow(p) for p in picks]
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader(); [w.writerow(p) for p in picks]
     print(f"\n已导出下注清单到: {out_file}  （{len(picks)} 条，阈值：EV≥{PICKS_MIN_EV}, Kelly≥{PICKS_MIN_KELLY}, VI≥{PICKS_MIN_VI}）")
+
+
+def summarize_diagnostics(diagnostics: Dict[str, dict]) -> None:
+    if not diagnostics:
+        return
+    group_map = {
+        "ev_ou_main_over": "OU主盘",
+        "ev_ou_main_under": "OU主盘",
+        "ev_ou_over2.5": "OU@2.5",
+        "ev_ou_under2.5": "OU@2.5",
+        "ev_1x2_home": "1X2",
+        "ev_1x2_draw": "1X2",
+        "ev_1x2_away": "1X2",
+        "ev_ah_home": "AH主盘",
+        "ev_ah_away": "AH主盘",
+        "ev_crn_main_over": "角球主盘",
+        "ev_crn_main_under": "角球主盘",
+    }
+    summary: Dict[str, dict] = {}
+    group_members: Dict[str, Dict[str, dict]] = defaultdict(dict)
+    for key, data in diagnostics.items():
+        group = group_map.get(key, key)
+        group_members[group][key] = data
+        bucket = summary.setdefault(
+            group,
+            {
+                "seen": 0,
+                "ev_inputs": 0,
+                "tags": Counter(),
+                "reasons": defaultdict(Counter),
+                "ev_sum": defaultdict(float),
+                "ev_count": defaultdict(int),
+                "kelly_sum": defaultdict(float),
+                "kelly_count": defaultdict(int),
+            },
+        )
+        bucket["seen"] += int(data.get("seen", 0) or 0)
+        bucket["ev_inputs"] += int(data.get("ev_inputs", 0) or 0)
+        bucket["tags"].update(data.get("tags", {}))
+        reasons_map = data.get("reasons", {}) or {}
+        for tag, counter in reasons_map.items():
+            bucket["reasons"][tag].update(counter)
+        for tag, value in (data.get("ev_sum", {}) or {}).items():
+            bucket["ev_sum"][tag] += float(value)
+        for tag, value in (data.get("ev_count", {}) or {}).items():
+            bucket["ev_count"][tag] += int(value)
+        for tag, value in (data.get("kelly_sum", {}) or {}).items():
+            bucket["kelly_sum"][tag] += float(value)
+        for tag, value in (data.get("kelly_count", {}) or {}).items():
+            bucket["kelly_count"][tag] += int(value)
+
+    print("\n=== 市场闸门诊断 ===")
+    for group, stats in summary.items():
+        seen = stats.get("seen", 0)
+        ev_inputs = stats.get("ev_inputs", 0)
+        print(f"[候选池] {group}: 有赔率={seen}, 形成ev_input={ev_inputs}")
+        for tag in ("invalid", "reject", "low", "review", "keep"):
+            count = stats["tags"].get(tag, 0)
+            if not count:
+                continue
+            line = f"  - {tag}: {count}"
+            if tag in ("invalid", "reject"):
+                reasons = stats["reasons"].get(tag)
+                if reasons:
+                    parts = [f"{name}:{reasons[name]}" for name in sorted(reasons, key=lambda n: (-reasons[n], n))]
+                    line += f" ({', '.join(parts)})"
+            else:
+                ev_count = stats["ev_count"].get(tag, 0)
+                k_count = stats["kelly_count"].get(tag, 0)
+                extras: List[str] = []
+                if ev_count:
+                    avg_ev = stats["ev_sum"][tag] / ev_count
+                    extras.append(f"EV均值={avg_ev*100:.2f}%")
+                if k_count:
+                    avg_k = stats["kelly_sum"][tag] / k_count
+                    extras.append(f"Kelly均值={avg_k*100:.2f}%")
+                if extras:
+                    line += f" ({', '.join(extras)})"
+            print(line)
+        members = group_members.get(group, {})
+        if len(members) > 1:
+            for member_key in sorted(members.keys()):
+                member_data = members[member_key]
+                seen_sub = member_data.get("seen", 0)
+                inputs_sub = member_data.get("ev_inputs", 0)
+                tags_sub = member_data.get("tags") or {}
+                tag_summary = ", ".join(
+                    f"{tag}:{tags_sub.get(tag, 0)}"
+                    for tag in ("invalid", "reject", "low", "review", "keep")
+                    if tags_sub.get(tag, 0)
+                )
+                detail = f"有赔率={seen_sub}, 形成ev_input={inputs_sub}"
+                if tag_summary:
+                    detail += f" [{tag_summary}]"
+                reasons_sub = member_data.get("reasons") or {}
+                reason_bits = []
+                for tag in ("invalid", "reject"):
+                    counter = reasons_sub.get(tag)
+                    if not counter:
+                        continue
+                    parts = [f"{name}:{counter[name]}" for name in sorted(counter, key=lambda n: (-counter[n], n))]
+                    reason_bits.append(f"{tag}({', '.join(parts)})")
+                if reason_bits:
+                    detail += f" {{{'; '.join(reason_bits)}}}"
+                print(f"    · {member_key}: {detail}")
 
 def _median(arr: List[float]) -> Optional[float]:
     arr = [float(x) for x in arr if x];
@@ -749,6 +1188,19 @@ def _to_float(x, default=None):
     except:
         return default
 
+
+def _parse_handicap_text(value: Optional[str]) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value)
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", text.replace(",", "."))
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except Exception:
+        return None
+
 def build_ah_lines(odds: dict) -> dict:
     """
     统一把 AH 全线提取/归一（支持多个可能的键名和数据形态）：
@@ -768,44 +1220,120 @@ def build_ah_lines(odds: dict) -> dict:
     for k in cand_keys:
         if isinstance(odds.get(k), dict) and odds[k]:
             raw = odds[k]; break
-    if raw is None:
-        return {}
+    out: dict[str, dict] = {}
 
-    out = {}
-    for line_key, sides in raw.items():
-        ln = _to_float(line_key, default=None)
-        if ln is None or not isinstance(sides, dict):
-            continue
-
-        hs = sides.get("home")
-        as_ = sides.get("away")
-
-        # 支持“列表/单值”
-        if isinstance(hs, (list, tuple)):
-            hs = [_to_float(v) for v in hs if _to_float(v) is not None and 1.10 <= _to_float(v) <= 100]
-            oh = _median(hs)
-            cnt_h = len(hs)
+    def _merge_line(line_val: float, data: dict) -> None:
+        key = str(float(line_val))
+        existing = out.get(key)
+        if existing is None:
+            out[key] = data
+            return
+        existing_cnt = min(int(existing.get("home_cnt", 0) or 0), int(existing.get("away_cnt", 0) or 0))
+        new_cnt = min(int(data.get("home_cnt", 0) or 0), int(data.get("away_cnt", 0) or 0))
+        existing_or = float(existing.get("overround", 9.9) or 9.9)
+        new_or = float(data.get("overround", 9.9) or 9.9)
+        existing_age = existing.get("update_age_min")
+        new_age = data.get("update_age_min")
+        better = False
+        if new_cnt > existing_cnt:
+            better = True
+        elif new_cnt == existing_cnt and new_or < existing_or:
+            better = True
+        elif new_cnt == existing_cnt and new_or == existing_or:
+            if new_age is not None and (existing_age is None or new_age < existing_age):
+                better = True
+        if better:
+            out[key] = data
         else:
-            oh = _to_float(hs)
-            cnt_h = 1 if oh is not None else 0
+            if existing_age is None or (new_age is not None and new_age < existing_age):
+                existing["update_age_min"] = new_age
 
-        if isinstance(as_, (list, tuple)):
-            as_ = [_to_float(v) for v in as_ if _to_float(v) is not None and 1.10 <= _to_float(v) <= 100]
-            oa = _median(as_)
-            cnt_a = len(as_)
-        else:
-            oa = _to_float(as_)
-            cnt_a = 1 if oa is not None else 0
+    if raw is not None:
+        for line_key, sides in raw.items():
+            ln = _to_float(line_key, default=None)
+            if ln is None or not isinstance(sides, dict):
+                continue
 
-        if oh is None or oa is None:
+            hs = sides.get("home")
+            as_ = sides.get("away")
+
+            # 支持“列表/单值”
+            if isinstance(hs, (list, tuple)):
+                hs = [_to_float(v) for v in hs if _to_float(v) is not None and 1.10 <= _to_float(v) <= 100]
+                oh = _median(hs)
+                cnt_h = len(hs)
+            else:
+                oh = _to_float(hs)
+                cnt_h = 1 if oh is not None else 0
+
+            if isinstance(as_, (list, tuple)):
+                as_ = [_to_float(v) for v in as_ if _to_float(v) is not None and 1.10 <= _to_float(v) <= 100]
+                oa = _median(as_)
+                cnt_a = len(as_)
+            else:
+                oa = _to_float(as_)
+                cnt_a = 1 if oa is not None else 0
+
+            if oh is None or oa is None:
+                continue
+
+            oround = _ou_overround(oh, oa)
+            data = {
+                "home_median": float(oh),
+                "away_median": float(oa),
+                "home_cnt": int(cnt_h),
+                "away_cnt": int(cnt_a),
+                "overround": float(oround),
+                "update_age_min": _to_float(sides.get("update_age_min")),
+            }
+            _merge_line(float(ln), data)
+
+    list_keys = [
+        "asian_handicap",
+        "Asian Handicap",
+        "Handicap (2-Way)",
+        "handicap_2_way",
+        "ah_list",
+    ]
+
+    for key in list_keys:
+        entries = odds.get(key)
+        if not isinstance(entries, list):
             continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            ln = entry.get("handicap") or entry.get("line")
+            ln_val = _to_float(ln)
+            if ln_val is None:
+                ln_val = _parse_handicap_text(entry.get("value") or entry.get("label"))
+            if ln_val is None:
+                continue
+            oh = entry.get("home_odds") or entry.get("home") or entry.get("odds_home") or entry.get("price_home")
+            oa = entry.get("away_odds") or entry.get("away") or entry.get("odds_away") or entry.get("price_away")
+            oh_val = _to_float(oh)
+            oa_val = _to_float(oa)
+            if oh_val is None or oa_val is None:
+                continue
+            cnt_raw = entry.get("bookmakers") or entry.get("count")
+            if isinstance(cnt_raw, dict):
+                cnt_raw = cnt_raw.get("count") or cnt_raw.get("total")
+            if isinstance(cnt_raw, (list, tuple)):
+                cnt_val = len(cnt_raw)
+            else:
+                cnt_val = _to_float(cnt_raw, default=None)
+            cnt = int(cnt_val) if cnt_val and cnt_val > 0 else 1
+            update_age = _to_float(entry.get("update_age_min") or entry.get("age_min") or entry.get("updateMinutes"))
+            data = {
+                "home_median": float(oh_val),
+                "away_median": float(oa_val),
+                "home_cnt": cnt,
+                "away_cnt": cnt,
+                "overround": float(_ou_overround(oh_val, oa_val)),
+                "update_age_min": update_age,
+            }
+            _merge_line(float(ln_val), data)
 
-        oround = _ou_overround(oh, oa)
-        out[str(float(ln))] = {
-            "home_median": float(oh), "away_median": float(oa),
-            "home_cnt": int(cnt_h), "away_cnt": int(cnt_a),
-            "overround": float(oround)
-        }
     return out
 
 def select_best_ah_main(ah_lines: dict, strict: int = 1) -> dict | None:
@@ -887,6 +1415,7 @@ def main():
 
     rows_all: List[Dict] = []
     matrix_rows: List[Dict] = []
+    diagnostics: Dict[str, dict] = {}
 
     # 全线榜单池
     ou_all_over, ou_all_under = [], []
@@ -924,10 +1453,38 @@ def main():
             a_stats=a_st,
             league_avg=league_avg,
         )
-        lam_home, lam_away, lam_weights = blend_lambda_models(lambda_models, LAMBDA_MODEL_CONFIG)
+        lam_home, lam_away, lam_weights = blend_lambda_models(
+            lambda_models,
+            LAMBDA_MODEL_CONFIG,
+            league_avg=league_avg,
+            league_tier=league_tier,
+            home_stats=h_st,
+            away_stats=a_st,
+        )
         lam_detail = format_lambda_detail(lambda_models, lam_weights)
         if LOG_LAMBDA_BLEND:
             log_lambda_blend(home_name, away_name, lambda_models, lam_weights, lam_home, lam_away)
+
+        data_quality_score: float | None = None
+        sample_size_recent: float | None = None
+        recent_meta = (lambda_models.get("recent") or {}).get("meta") if isinstance(lambda_models.get("recent"), dict) else None
+        if isinstance(recent_meta, dict) and recent_meta:
+            try:
+                eff_home = float(recent_meta.get("home_eff_mix", 1.0))
+            except (TypeError, ValueError):
+                eff_home = 1.0
+            try:
+                eff_away = float(recent_meta.get("away_eff_mix", 1.0))
+            except (TypeError, ValueError):
+                eff_away = 1.0
+            coverage = 1.0 - 0.5 * (max(0.0, min(1.0, eff_home)) + max(0.0, min(1.0, eff_away)))
+            data_quality_score = max(0.0, min(1.0, coverage))
+            try:
+                hg = float(recent_meta.get("home_games_used", 0.0))
+                ag = float(recent_meta.get("away_games_used", 0.0))
+                sample_size_recent = max(0.0, 0.5 * (hg + ag))
+            except (TypeError, ValueError):
+                sample_size_recent = None
 
         sim = monte_carlo_simulate(lam_home, lam_away, n_sims=N_SIMS_GOALS, over_line=2.5)
         _, _, totals = simulate_goals(lam_home, lam_away, n_sims=N_SIMS_GOALS)
@@ -936,9 +1493,46 @@ def main():
 
         odds = odds_by_fixture(fx_id) if fx_id else {}
 
+        ou_lines = odds.get("ou_lines") if isinstance(odds.get("ou_lines"), dict) else {}
+        if not ou_lines and isinstance(odds.get("_raw_ou_map"), dict):
+            for line, sides in odds["_raw_ou_map"].items():
+                ov = [x for x in (sides.get("over") or []) if x]
+                un = [x for x in (sides.get("under") or []) if x]
+                if not ov or not un:
+                    continue
+                om, um = _median(ov), _median(un)
+                oround = _ou_overround(om, um)
+                ou_lines[str(float(line))] = {
+                    "over_median": om,
+                    "under_median": um,
+                    "over_cnt": len(ov),
+                    "under_cnt": len(un),
+                    "overround": oround,
+                }
+
+        crn_lines = odds.get("crn_lines") if isinstance(odds.get("crn_lines"), dict) else {}
+        if not crn_lines and isinstance(odds.get("_raw_crn_map"), dict):
+            for line, sides in odds["_raw_crn_map"].items():
+                ov = [x for x in (sides.get("over") or []) if x]
+                un = [x for x in (sides.get("under") or []) if x]
+                if not ov or not un:
+                    continue
+                om, um = _median(ov), _median(un)
+                oround = _ou_overround(om, um)
+                crn_lines[str(float(line))] = {
+                    "over_median": om,
+                    "under_median": um,
+                    "over_cnt": len(ov),
+                    "under_cnt": len(un),
+                    "overround": oround,
+                }
+
+        ah_lines = build_ah_lines(odds)
+
         flag_map: Dict[str, str] = {}
         flag_reason_map: Dict[str, str] = {}
         vi_map: Dict[str, float | None] = {}
+        ev_meta_map: Dict[str, Dict[str, float | str]] = {}
 
         # ===== 1X2 =====
         o1_h,o1_d,o1_a = odds.get("1x2_home"),odds.get("1x2_draw"),odds.get("1x2_away")
@@ -948,6 +1542,7 @@ def main():
         overround_1x2 = odds.get("1x2_overround")
         update_age_1x2 = odds.get("1x2_update_age_min")
         ev1_h=ev1_d=ev1_a=k1_h=k1_d=k1_a=None
+        consensus_1x2: Dict[str, float] = {}
         ok1 = sanitize_1x2(o1_h,o1_d,o1_a)
         if ok1:
             o1_h,o1_d,o1_a = ok1
@@ -956,6 +1551,23 @@ def main():
             ev1_a,k1_a = ev_kelly_binary(sim["p_away"], o1_a)
             if is_ev_outlier(max([x for x in (ev1_h,ev1_d,ev1_a) if x is not None], default=0)):
                 ev1_h=ev1_d=ev1_a=k1_h=k1_d=k1_a=None
+            else:
+                try:
+                    inv_h = 1.0 / float(o1_h)
+                    inv_d = 1.0 / float(o1_d)
+                    inv_a = 1.0 / float(o1_a)
+                    total_inv = inv_h + inv_d + inv_a
+                    if total_inv > 0:
+                        consensus_1x2 = {
+                            "home": inv_h / total_inv,
+                            "draw": inv_d / total_inv,
+                            "away": inv_a / total_inv,
+                        }
+                except Exception:
+                    consensus_1x2 = {}
+
+        pre_tag_1x2 = None if ok1 else "invalid"
+        pre_reasons_1x2 = None if ok1 else ("no_odds",)
 
         cnts_1x2 = [int(c) for c in (cnt_1x2_h, cnt_1x2_d, cnt_1x2_a) if isinstance(c, (int, float)) and c > 0]
         min_cnt_1x2 = min(cnts_1x2) if cnts_1x2 else None
@@ -972,6 +1584,16 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=o1_h,
+            model_prob=sim.get("p_home"),
+            consensus_prob=consensus_1x2.get("home") if consensus_1x2 else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
+            diagnostics=diagnostics,
+            diag_key="ev_1x2_home",
+            pre_tag=pre_tag_1x2,
+            pre_reasons=pre_reasons_1x2,
         )
         ev1_d, k1_d = apply_ev_filter(
             "ev_1x2_draw",
@@ -985,6 +1607,16 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=o1_d,
+            model_prob=sim.get("p_draw"),
+            consensus_prob=consensus_1x2.get("draw") if consensus_1x2 else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
+            diagnostics=diagnostics,
+            diag_key="ev_1x2_draw",
+            pre_tag=pre_tag_1x2,
+            pre_reasons=pre_reasons_1x2,
         )
         ev1_a, k1_a = apply_ev_filter(
             "ev_1x2_away",
@@ -998,6 +1630,16 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=o1_a,
+            model_prob=sim.get("p_away"),
+            consensus_prob=consensus_1x2.get("away") if consensus_1x2 else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
+            diagnostics=diagnostics,
+            diag_key="ev_1x2_away",
+            pre_tag=pre_tag_1x2,
+            pre_reasons=pre_reasons_1x2,
         )
 
         # ===== Goals OU 主盘 =====
@@ -1009,15 +1651,51 @@ def main():
         ou_overround   = odds.get("ou_main_overround") or 9.9
 
         ev_main_over = ev_main_under = k_main_over = k_main_under = None
-        if ou_main_line is not None and ou_main_over is not None and ou_main_under is not None:
+        p_model_ou_main_over = p_model_ou_main_under = None
+        consensus_ou_main: Dict[str, float] = {}
+        consensus_ou_line = _consensus_line(ou_lines, market="ou")
+        ou_pre_tag: str | None = None
+        ou_pre_reasons: Tuple[str, ...] | None = None
+        if ou_main_line is None or ou_main_over is None or ou_main_under is None:
+            ou_pre_tag = "invalid"
+            ou_pre_reasons = ("no_odds",)
+        else:
             pair = sanitize_ou_pair(ou_main_over, ou_main_under)
-            if pair and (not STRICT_OU_MAIN or (ou_cnt_o >= OU_MIN_CNT and ou_cnt_u >= OU_MIN_CNT and ou_overround <= OU_MAX_OR)):
+            if not pair:
+                ou_pre_tag = "invalid"
+                ou_pre_reasons = ("no_odds",)
+            else:
                 ou_main_over, ou_main_under = pair
-                res = ou_ev_kelly_from_totals_quarter(float(ou_main_line), float(ou_main_over), float(ou_main_under), totals)
-                ev_main_over, k_main_over = res["EV_over"],  res["Kelly_over"]
-                ev_main_under, k_main_under = res["EV_under"], res["Kelly_under"]
-                if is_ev_outlier(max([x for x in (ev_main_over, ev_main_under) if x is not None], default=0)):
-                    ev_main_over = ev_main_under = k_main_over = k_main_under = None
+                strict_reasons: list[str] = []
+                if STRICT_OU_MAIN:
+                    if ou_cnt_o < OU_MIN_CNT or ou_cnt_u < OU_MIN_CNT:
+                        strict_reasons.append("bookmakers")
+                    if ou_overround > OU_MAX_OR:
+                        strict_reasons.append("overround")
+                if strict_reasons:
+                    ou_pre_tag = "invalid"
+                    ou_pre_reasons = tuple(sorted(set(strict_reasons)))
+                elif not _line_matches_consensus(float(ou_main_line), consensus_ou_line):
+                    ou_pre_tag = "invalid"
+                    ou_pre_reasons = ("line_mismatch",)
+                else:
+                    res = ou_ev_kelly_from_totals_quarter(float(ou_main_line), float(ou_main_over), float(ou_main_under), totals)
+                    ev_main_over, k_main_over = res["EV_over"],  res["Kelly_over"]
+                    ev_main_under, k_main_under = res["EV_under"], res["Kelly_under"]
+                    p_model_ou_main_over = res.get("p_over_success")
+                    p_model_ou_main_under = res.get("p_under_success")
+                    if is_ev_outlier(max([x for x in (ev_main_over, ev_main_under) if x is not None], default=0)):
+                        ev_main_over = ev_main_under = k_main_over = k_main_under = None
+                        p_model_ou_main_over = p_model_ou_main_under = None
+                    else:
+                        try:
+                            inv_o = 1.0 / float(ou_main_over)
+                            inv_u = 1.0 / float(ou_main_under)
+                            total_inv = inv_o + inv_u
+                            if total_inv > 0:
+                                consensus_ou_main = {"over": inv_o / total_inv, "under": inv_u / total_inv}
+                        except Exception:
+                            consensus_ou_main = {}
 
         cnts_ou_main = [int(c) for c in (ou_cnt_o, ou_cnt_u) if isinstance(c, (int, float)) and c > 0]
         min_cnt_ou_main = min(cnts_ou_main) if cnts_ou_main else None
@@ -1035,6 +1713,16 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=ou_main_over,
+            model_prob=p_model_ou_main_over,
+            consensus_prob=consensus_ou_main.get("over") if consensus_ou_main else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
+            diagnostics=diagnostics,
+            diag_key="ev_ou_main_over",
+            pre_tag=ou_pre_tag,
+            pre_reasons=ou_pre_reasons,
         )
         ev_main_under, k_main_under = apply_ev_filter(
             "ev_ou_main_under",
@@ -1048,11 +1736,23 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=ou_main_under,
+            model_prob=p_model_ou_main_under,
+            consensus_prob=consensus_ou_main.get("under") if consensus_ou_main else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
+            diagnostics=diagnostics,
+            diag_key="ev_ou_main_under",
+            pre_tag=ou_pre_tag,
+            pre_reasons=ou_pre_reasons,
         )
 
         # ===== OU@2.5 参考 =====
         o25_over,o25_under = odds.get("ou_over_2_5"),odds.get("ou_under_2_5")
         ev25_over=ev25_under=k25_over=k25_under=None
+        p_model_ou25_over = p_model_ou25_under = None
+        consensus_ou25: Dict[str, float] = {}
         ok25 = sanitize_ou_pair(o25_over,o25_under)
         overround_ou25 = None
         if ok25:
@@ -1060,13 +1760,22 @@ def main():
             res25 = ou_ev_kelly_from_totals_quarter(2.5, float(o25_over), float(o25_under), totals)
             ev25_over, k25_over = res25["EV_over"],  res25["Kelly_over"]
             ev25_under, k25_under = res25["EV_under"], res25["Kelly_under"]
+            p_model_ou25_over = res25.get("p_over_success")
+            p_model_ou25_under = res25.get("p_under_success")
             if is_ev_outlier(max([x for x in (ev25_over,ev25_under) if x is not None], default=0)):
                 ev25_over=ev25_under=k25_over=k25_under=None
+                p_model_ou25_over = p_model_ou25_under = None
             else:
                 try:
                     overround_ou25 = float(1.0/float(o25_over) + 1.0/float(o25_under))
+                    inv_o = 1.0 / float(o25_over)
+                    inv_u = 1.0 / float(o25_under)
+                    total_inv = inv_o + inv_u
+                    if total_inv > 0:
+                        consensus_ou25 = {"over": inv_o / total_inv, "under": inv_u / total_inv}
                 except Exception:
                     overround_ou25 = None
+                    consensus_ou25 = {}
 
         min_cnt_ou_25 = min_cnt_ou_main
         ev25_over, k25_over = apply_ev_filter(
@@ -1081,6 +1790,14 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=o25_over,
+            model_prob=p_model_ou25_over,
+            consensus_prob=consensus_ou25.get("over") if consensus_ou25 else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
+            diagnostics=diagnostics,
+            diag_key="ev_ou_over2.5",
         )
         ev25_under, k25_under = apply_ev_filter(
             "ev_ou_under2.5",
@@ -1094,6 +1811,14 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=o25_under,
+            model_prob=p_model_ou25_under,
+            consensus_prob=consensus_ou25.get("under") if consensus_ou25 else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
+            diagnostics=diagnostics,
+            diag_key="ev_ou_under2.5",
         )
 
         # ===== AH 全线（统一归一）
@@ -1105,6 +1830,7 @@ def main():
         ah_cnt_a = odds.get("ah_away_cnt") or 0
         ah_overround = odds.get("ah_overround")
         ah_update_age = odds.get("ah_main_update_age_min")
+        consensus_ah_line = _consensus_line(ah_lines, market="ah")
         if ah_line is None or ah_oh is None or ah_oa is None:
             pick = select_best_ah_main(ah_lines, strict=STRICT_AH_MAIN)
             if pick:
@@ -1117,16 +1843,55 @@ def main():
                 ah_update_age = pick.get("update_age_min", ah_update_age)
 
         ev_ah_h = ev_ah_a = k_ah_h = k_ah_a = None
+        p_model_ah_home = p_model_ah_away = None
+        consensus_ah: Dict[str, float] = {}
+        ah_pre_tag: str | None = None
+        ah_pre_reasons: Tuple[str, ...] | None = None
         if ah_line is not None and ah_oh is not None and ah_oa is not None:
             cnt_ah_has_line += 1
-            probs_ah = ah_probabilities_from_lams(lam_home, lam_away, h=float(ah_line), n_sims=N_SIMS_GOALS)
-            evk = ah_ev_kelly(probs_ah, odds_home=float(ah_oh), odds_away=float(ah_oa))
-            if isinstance(evk.get("home"), dict):
-                ev_ah_h, k_ah_h = evk["home"].get("EV"), evk["home"].get("Kelly")
-            if isinstance(evk.get("away"), dict):
-                ev_ah_a, k_ah_a = evk["away"].get("EV"), evk["away"].get("Kelly")
-            if is_ev_outlier(max([x for x in (ev_ah_h, ev_ah_a) if x is not None], default=0)):
-                ev_ah_h = ev_ah_a = k_ah_h = k_ah_a = None
+            strict_reasons: list[str] = []
+            if STRICT_AH_MAIN:
+                if min(ah_cnt_h or 0, ah_cnt_a or 0) < AH_MIN_CNT:
+                    strict_reasons.append("bookmakers")
+                try:
+                    if ah_overround and float(ah_overround) > AH_MAX_OR:
+                        strict_reasons.append("overround")
+                except Exception:
+                    pass
+            if strict_reasons:
+                ah_pre_tag = "invalid"
+                ah_pre_reasons = tuple(sorted(set(strict_reasons)))
+            elif not _line_matches_consensus(float(ah_line), consensus_ah_line, tolerance=0.25):
+                ah_pre_tag = "invalid"
+                ah_pre_reasons = ("line_mismatch",)
+            else:
+                probs_ah = ah_probabilities_from_lams(lam_home, lam_away, h=float(ah_line), n_sims=N_SIMS_GOALS)
+                evk = ah_ev_kelly(probs_ah, odds_home=float(ah_oh), odds_away=float(ah_oa))
+                home_info = probs_ah.get("home", {}) if isinstance(probs_ah, dict) else {}
+                away_info = probs_ah.get("away", {}) if isinstance(probs_ah, dict) else {}
+                if isinstance(evk.get("home"), dict):
+                    ev_ah_h, k_ah_h = evk["home"].get("EV"), evk["home"].get("Kelly")
+                if isinstance(evk.get("away"), dict):
+                    ev_ah_a, k_ah_a = evk["away"].get("EV"), evk["away"].get("Kelly")
+                if is_ev_outlier(max([x for x in (ev_ah_h, ev_ah_a) if x is not None], default=0)):
+                    ev_ah_h = ev_ah_a = k_ah_h = k_ah_a = None
+                else:
+                    try:
+                        p_model_ah_home = float(home_info.get("p_win", 0.0)) + 0.5 * float(home_info.get("p_push", 0.0))
+                        p_model_ah_away = float(away_info.get("p_win", 0.0)) + 0.5 * float(away_info.get("p_push", 0.0))
+                    except Exception:
+                        p_model_ah_home = p_model_ah_away = None
+                    try:
+                        inv_h = 1.0 / float(ah_oh)
+                        inv_a = 1.0 / float(ah_oa)
+                        total_inv = float(ah_overround) if ah_overround else (inv_h + inv_a)
+                        if total_inv > 0:
+                            consensus_ah = {"home": inv_h / total_inv, "away": inv_a / total_inv}
+                    except Exception:
+                        consensus_ah = {}
+        else:
+            ah_pre_tag = "invalid"
+            ah_pre_reasons = ("no_odds",)
 
         cnts_ah = [int(c) for c in (ah_cnt_h, ah_cnt_a) if isinstance(c, (int, float)) and c > 0]
         min_cnt_ah = min(cnts_ah) if cnts_ah else None
@@ -1142,6 +1907,16 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=ah_oh,
+            model_prob=p_model_ah_home,
+            consensus_prob=consensus_ah.get("home") if consensus_ah else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
+            diagnostics=diagnostics,
+            diag_key="ev_ah_home",
+            pre_tag=ah_pre_tag,
+            pre_reasons=ah_pre_reasons,
         )
         ev_ah_a, k_ah_a = apply_ev_filter(
             "ev_ah_away",
@@ -1155,6 +1930,16 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=ah_oa,
+            model_prob=p_model_ah_away,
+            consensus_prob=consensus_ah.get("away") if consensus_ah else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
+            diagnostics=diagnostics,
+            diag_key="ev_ah_away",
+            pre_tag=ah_pre_tag,
+            pre_reasons=ah_pre_reasons,
         )
 
         if flag_map.get("ev_ah_home") in ("keep", "review"):
@@ -1171,6 +1956,8 @@ def main():
         crn_overround  = odds.get("crn_main_overround") or 9.9
 
         ev_crn_over = ev_crn_under = k_crn_over = k_crn_under = None
+        p_model_crn_over = p_model_crn_under = None
+        consensus_crn: Dict[str, float] = {}
         crn_totals_list: List[int] | None = None
 
         if crn_main_line is not None and crn_main_over is not None and crn_main_under is not None:
@@ -1183,8 +1970,20 @@ def main():
                 resC = ou_ev_kelly_from_totals_quarter(float(crn_main_line), float(crn_main_over), float(crn_main_under), crn_totals_list)
                 ev_crn_over, k_crn_over = resC["EV_over"],  resC["Kelly_over"]
                 ev_crn_under, k_crn_under = resC["EV_under"], resC["Kelly_under"]
+                p_model_crn_over = resC.get("p_over_success")
+                p_model_crn_under = resC.get("p_under_success")
                 if is_ev_outlier(max([x for x in (ev_crn_over,ev_crn_under) if x is not None], default=0)):
                     ev_crn_over = ev_crn_under = k_crn_over = k_crn_under = None
+                    p_model_crn_over = p_model_crn_under = None
+                else:
+                    try:
+                        inv_o = 1.0 / float(crn_main_over)
+                        inv_u = 1.0 / float(crn_main_under)
+                        total_inv = inv_o + inv_u
+                        if total_inv > 0:
+                            consensus_crn = {"over": inv_o / total_inv, "under": inv_u / total_inv}
+                    except Exception:
+                        consensus_crn = {}
 
         cnts_crn = [int(c) for c in (crn_cnt_o, crn_cnt_u) if isinstance(c, (int, float)) and c > 0]
         min_cnt_crn = min(cnts_crn) if cnts_crn else None
@@ -1202,6 +2001,14 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=crn_main_over,
+            model_prob=p_model_crn_over,
+            consensus_prob=consensus_crn.get("over") if consensus_crn else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
+            diagnostics=diagnostics,
+            diag_key="ev_crn_main_over",
         )
         ev_crn_under, k_crn_under = apply_ev_filter(
             "ev_crn_main_under",
@@ -1215,30 +2022,17 @@ def main():
             flag_map=flag_map,
             reason_map=flag_reason_map,
             vi_map=vi_map,
+            meta_map=ev_meta_map,
+            odds=crn_main_under,
+            model_prob=p_model_crn_under,
+            consensus_prob=consensus_crn.get("under") if consensus_crn else None,
+            data_quality=data_quality_score,
+            sample_size=sample_size_recent,
+            diagnostics=diagnostics,
+            diag_key="ev_crn_main_under",
         )
 
-        # ===== 全线榜单池 & 盘口矩阵（优先使用 *_lines；无则回退 _raw_*） =====
-        ou_lines = odds.get("ou_lines") or {}
-        crn_lines = odds.get("crn_lines") or {}
-        # —— AH 用统一归一后的
-        #   ah_lines 已在上面 build_ah_lines(odds) 生成
-
-        # 回退：当 *_lines 缺失时，从 _raw_* 现算（OU/CRN 保持原逻辑）
-        if not ou_lines and odds.get("_raw_ou_map"):
-            for line, sides in odds["_raw_ou_map"].items():
-                ov = [x for x in sides.get("over", []) if x]; un = [x for x in sides.get("under", []) if x]
-                if not ov or not un: continue
-                om, um = _median(ov), _median(un); oround = _ou_overround(om, um)
-                ou_lines[str(float(line))] = {"over_median": om, "under_median": um,
-                                              "over_cnt": len(ov), "under_cnt": len(un), "overround": oround}
-        if not crn_lines and odds.get("_raw_crn_map"):
-            for line, sides in odds["_raw_crn_map"].items():
-                ov = [x for x in sides.get("over", []) if x]; un = [x for x in sides.get("under", []) if x]
-                if not ov or not un: continue
-                om, um = _median(ov), _median(un); oround = _ou_overround(om, um)
-                crn_lines[str(float(line))] = {"over_median": om, "under_median": um,
-                                               "over_cnt": len(ov), "under_cnt": len(un), "overround": oround}
-
+        # ===== 全线榜单池 & 盘口矩阵（优先使用 *_lines） =====
         # —— 全线榜单池（OU）
         for sline, info in (ou_lines.items() if isinstance(ou_lines, dict) else []):
             try: line = float(sline)
@@ -1408,6 +2202,32 @@ def main():
             row[f"flag_{key}"] = tag
         for key, reason in flag_reason_map.items():
             row[f"flag_reason_{key}"] = reason
+        for key, meta in ev_meta_map.items():
+            numeric_fields = (
+                ("quality", 4),
+                ("ev_input", 6),
+                ("ev_calibrated", 6),
+                ("score", 6),
+                ("liquidity", 4),
+                ("kelly_full", 6),
+                ("threshold_score_keep", 6),
+                ("threshold_score_review", 6),
+                ("threshold_quality_keep", 6),
+                ("threshold_quality_reject", 6),
+                ("threshold_liquidity_keep", 6),
+                ("threshold_kelly_keep", 6),
+                ("threshold_ev_keep_min", 6),
+                ("threshold_ev_keep_max", 6),
+                ("threshold_ev_drop", 6),
+            )
+            for field, precision in numeric_fields:
+                value = meta.get(field)
+                if value is None:
+                    continue
+                try:
+                    row[f"{field}_{key}"] = round(float(value), precision)
+                except (TypeError, ValueError):
+                    continue
 
         if lam_detail:
             row["lam_blend_detail"] = lam_detail
@@ -1419,6 +2239,8 @@ def main():
         done += 1
         if done % 30 == 0 or done == len(fixtures):
             print(f"……已处理 {done}/{len(fixtures)} 场")
+
+    summarize_diagnostics(diagnostics)
 
     # ===== 导出全量 CSV =====
     out_dir = os.path.join(os.getcwd(), "out"); os.makedirs(out_dir, exist_ok=True)

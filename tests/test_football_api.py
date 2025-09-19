@@ -62,8 +62,8 @@ except ModuleNotFoundError:  # pragma: no cover
     dotenv_module.load_dotenv = _dummy_load_dotenv
     sys.modules["dotenv"] = dotenv_module
 
-_MODULE_PATH = Path(__file__).resolve().parents[1] / "daily_" / "daily_" / "football_api.py"
-_SPEC = importlib.util.spec_from_file_location("daily_football_api", _MODULE_PATH)
+_MODULE_PATH = Path(__file__).resolve().parents[1] / "src" / "api" / "football_api.py"
+_SPEC = importlib.util.spec_from_file_location("src_football_api", _MODULE_PATH)
 football_api = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = football_api
 assert _SPEC.loader is not None
