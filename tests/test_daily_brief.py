@@ -1,3 +1,4 @@
+
 import importlib.util
 import math
 import os
@@ -86,6 +87,7 @@ _LOADER.exec_module(_daily_brief_module)
 apply_ev_filter = getattr(_daily_brief_module, "apply_ev_filter")
 
 
+
 def test_apply_ev_filter_populates_diagnostics_meta() -> None:
     flag_map: dict[str, str] = {}
     reason_map: dict[str, str] = {}
@@ -130,3 +132,66 @@ def test_apply_ev_filter_populates_diagnostics_meta() -> None:
     assert math.isclose(float(thresholds["keep_min"]), 0.02, rel_tol=1e-9)
     assert math.isclose(float(thresholds["keep_max"]), 0.06, rel_tol=1e-9)
     assert math.isclose(float(thresholds["drop"]), 0.12, rel_tol=1e-9)
+
+
+
+def test_export_picks_applies_gate_levels(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    rows = [
+        {
+            "date_utc": "2025-09-19",
+            "kickoff_utc": "2025-09-19T12:00:00Z",
+            "league": "Sample League",
+            "league_tier": LEAGUE_TIER_TOP,
+            "home": "Team A",
+            "away": "Team B",
+            "ou_main_line": 2.5,
+            "odds_ou_main_over": 1.95,
+            "ou_main_over_cnt": 8,
+            "ou_main_under_cnt": 8,
+            "ou_main_overround": 1.08,
+            "ev_ou_main_over": 0.06,
+            "kelly_ou_main_over": 0.055,
+            "flag_ev_ou_main_over": "keep",
+            "quality_ev_ou_main_over": 0.8,
+            "ev_ou_main_under": None,
+            "kelly_ou_main_under": None,
+            "odds_1x2_home": 1.92,
+            "1x2_home_cnt": 9,
+            "1x2_draw_cnt": 9,
+            "1x2_away_cnt": 9,
+            "1x2_overround": 1.05,
+            "ev_1x2_home": 0.033,
+            "kelly_1x2_home": 0.032,
+            "flag_ev_1x2_home": "keep",
+            "quality_ev_1x2_home": 0.9,
+            "ev_1x2_draw": None,
+            "ev_1x2_away": None,
+            "ah_line": -0.25,
+            "odds_ah_home": 1.9,
+            "odds_ah_away": 1.9,
+            "ah_home_cnt": 10,
+            "ah_away_cnt": 10,
+            "ah_overround": 1.05,
+            "ev_ah_home": 0.024,
+            "kelly_ah_home": 0.028,
+            "flag_ev_ah_home": "keep",
+            "quality_ev_ah_home": 0.82,
+            "ev_ah_away": None,
+            "kelly_ah_away": None,
+        }
+    ]
+
+    export_picks(rows, "2025-09-19")
+
+    out_path = tmp_path / "out" / "picks_2025-09-19.csv"
+    assert out_path.exists()
+
+    with out_path.open(newline="", encoding="utf-8") as fh:
+        data = list(csv.DictReader(fh))
+
+    markets = {row["market"]: row for row in data}
+    assert markets["OU-Over"]["gate_level"] == "strict"
+    assert markets["1X2-Home"]["gate_level"] == "backoff1"
+    assert markets["AH-Home"]["gate_level"] == "backoff2"
+main

@@ -1,7 +1,7 @@
 # === src/api/football_api.py · 并发复用 + 退避重试 + 限速 + 轻量缓存 + 主盘/全线聚合（含角球/Asian Totals） ===
 from __future__ import annotations
 
-import os, json, time, hashlib, threading
+import os, json, time, hashlib, threading, re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import requests
@@ -191,21 +191,137 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
             return not any(t in n for t in forbid)
         return False
 
+    _AH_NAME_KEYWORDS = (
+        "asian handicap",
+        "asianhandicap",
+        "handicap",
+        "ah",
+        "ahc",
+        "hdp",
+        "亚盘",
+        "亚洲让球",
+        "让球",
+    )
+
+    def _is_half_or_team_market(name_lc: str) -> bool:
+        forbid = (
+            "1st half",
+            "first half",
+            "2nd half",
+            "second half",
+            "half time",
+            "half-time",
+            "halftime",
+            "1sthalf",
+            "secondhalf",
+            "team",
+        )
+        return any(term in name_lc for term in forbid)
+
+    def _normalise_handicap_token(token: str) -> float | None:
+        txt = token.strip().lower()
+        if not txt:
+            return None
+        txt = (
+            txt.replace("＋", "+")
+            .replace("−", "-")
+            .replace("–", "-")
+            .replace("—", "-")
+            .replace("½", ".5")
+            .replace("¼", ".25")
+            .replace("¾", ".75")
+        )
+        if txt in {"pk", "p", "pick", "pick'em", "pickem", "pick 'em"}:
+            return 0.0
+        txt = txt.replace("pick", "0") if txt.startswith("pick") else txt
+        txt = txt.replace("'", "")
+        if txt in {"ah", "ahc", "hdp"}:
+            return None
+        if any(ch.isalpha() for ch in txt):
+            return None
+        if ":" in txt:
+            parts = [p for p in txt.split(":") if p]
+            try:
+                nums = [float(p) for p in parts]
+            except ValueError:
+                nums = []
+            if len(nums) == 2:
+                return sum(nums) / len(nums)
+        if "/" in txt:
+            parts = [p for p in txt.split("/") if p]
+            try:
+                nums = [float(p) for p in parts]
+            except ValueError:
+                nums = []
+            if len(nums) == 2:
+                return sum(nums) / len(nums)
+        try:
+            return float(txt)
+        except ValueError:
+            return None
+
+    def _parse_handicap_field(value) -> float | None:
+        parsed = _parse_float(value)
+        if parsed is not None:
+            return parsed
+        if value is not None:
+            return _normalise_handicap_token(str(value))
+        return None
+
+    def _extract_handicap_from_value(raw_value: str) -> float | None:
+        if not raw_value:
+            return None
+        lowered = raw_value.lower().strip()
+        lowered = lowered.replace("home", " ")
+        lowered = lowered.replace("away", " ")
+        lowered = lowered.replace("主", " ")
+        lowered = lowered.replace("客", " ")
+        lowered = lowered.replace("@", " ")
+        lowered = lowered.replace("(", " ").replace(")", " ")
+        lowered = lowered.replace("home", " ").replace("away", " ")
+        lowered = lowered.replace("vs", " ")
+        lowered = lowered.replace(",", " ")
+        candidates = re.findall(
+            r"(?:(?:\+|-)?\d+(?:\.\d+)?(?:[:/](?:\+|-)?\d+(?:\.\d+)?)?|pk|pick'?em)",
+            lowered,
+        )
+        for cand in candidates:
+            line = _normalise_handicap_token(cand)
+            if line is not None:
+                return line
+        return None
+
+    def _extract_side(raw_value: str) -> str | None:
+        val = (raw_value or "").strip().lower()
+        prefixes = (
+            ("home", "home"),
+            ("主", "home"),
+            ("away", "away"),
+            ("客", "away"),
+            ("1", "home"),
+            ("2", "away"),
+            ("h", "home"),
+            ("a", "away"),
+        )
+        for prefix, side in prefixes:
+            if val.startswith(prefix):
+                return side
+        return None
+
     def is_asian_handicap(name: str) -> bool:
-        n = (name or "").lower()
-        if "asian handicap" in n or ("handicap" in n and "european" not in n):
-            forbid = [
-                "1st half",
-                "first half",
-                "2nd half",
-                "second half",
-                "half time",
-                "half-time",
-                "halftime",
-            ]
-            if any(term in n for term in forbid):
+        n = (name or "").strip().lower()
+        if not n:
+            return False
+        if _is_half_or_team_market(n):
+            return False
+        if any(term in n for term in ("corner", "cards", "booking")):
+            return False
+        if any(keyword in n for keyword in _AH_NAME_KEYWORDS):
+            if "european" in n or "1x2" in n:
                 return False
-            return "corner" not in n and "cards" not in n and "booking" not in n
+            return True
+        if _normalise_handicap_token(n) is not None:
+            return True
         return False
 
     def _parse_float(x):
@@ -307,31 +423,38 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
                 # 亚洲让球（非角球）
                 if is_asian_handicap(name):
                     for v in values:
-                        side_txt = (v.get("value") or "").lower().strip()   # "Home"/"Away"
-                        odd = _parse_float(v.get("odd"))
-                        line = _parse_float(v.get("handicap"))
-                        if side_txt not in ("home","away") or line is None or odd is None:
+                        raw_value = v.get("value")
+                        side_txt = (raw_value or "").strip().lower()
+                        side = side_txt if side_txt in ("home", "away") else _extract_side(raw_value)
+                        if side not in ("home", "away"):
                             continue
-                        if not (1.10 <= odd <= 50.0):
+                        odd = _parse_float(v.get("odd"))
+                        if odd is None or not (1.10 <= odd <= 50.0):
+                            continue
+                        line = _parse_handicap_field(v.get("handicap"))
+                        if line is None:
+                            line = _extract_handicap_from_value(raw_value)
+                        if line is None:
                             continue
 
                         line_val = float(line)
-                        # Reuse existing keys so that Home/Away selections from the same
-                        # bookmaker line land in the same entry (处理正负盘符). This fixes
-                        # cases where one side was inserted first with the opposite sign.
                         resolved_line: Optional[float] = None
                         for cand in (line_val, -line_val):
                             if cand in ah_map:
                                 resolved_line = cand
                                 break
                         if resolved_line is None:
-                            resolved_line = line_val if side_txt == "home" else -line_val
+                            resolved_line = line_val if side == "home" else -line_val
 
                         update_ts = _parse_update_ts(v.get("last_update") or v.get("update")) or bet_update
-                        entry = ah_map.setdefault(resolved_line, {"home": [], "away": [], "updates": []})
-                        entry[side_txt].append(odd)
+                        entry = ah_map.setdefault(
+                            resolved_line,
+                            {"home": [], "away": [], "updates": [], "raw_labels": set()},
+                        )
+                        entry[side].append(odd)
                         if update_ts is not None:
                             entry["updates"].append(update_ts)
+                        entry["raw_labels"].add(name or "")
 
     out: Dict[str, float] = {}
 
@@ -404,6 +527,7 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
         _,_,line,oh,oa,ch,ca,oround = pick
         out["ah_line"], out["ah_home_odds"], out["ah_away_odds"] = float(line), float(oh), float(oa)
         out["ah_home_cnt"], out["ah_away_cnt"], out["ah_overround"] = int(ch), int(ca), float(oround)
+        out["price_ah_home"], out["price_ah_away"] = float(oh), float(oa)
         updates = [u for u in ah_map.get(line, {}).get("updates", []) if u]
         if not updates and -line in ah_map:
             updates = [u for u in ah_map.get(-line, {}).get("updates", []) if u]
@@ -496,12 +620,22 @@ def odds_by_fixture(fixture_id: int) -> Dict[str, float]:
             updates = [float(x) for x in sides.get("updates", []) if x]
             if updates:
                 entry["updates"] = updates
+            raw_labels = sides.get("raw_labels")
+            if raw_labels:
+                entry["raw_labels"] = sorted({str(x).strip() for x in raw_labels if str(x).strip()})
             outm[key] = entry
         return outm
 
     out["_raw_ou_map"]  = _clean_ou_or_cr_map(ou_map)
     out["_raw_crn_map"] = _clean_ou_or_cr_map(cr_map)
     out["_raw_ah_map"]  = _clean_ah_map(ah_map)
+    ah_raw_labels = {}
+    for line_key, entry in out["_raw_ah_map"].items():
+        labels = entry.get("raw_labels")
+        if labels:
+            ah_raw_labels[str(line_key)] = list(labels)
+    if ah_raw_labels:
+        out["ah_raw_labels"] = ah_raw_labels
 
     # —— 已清洗“全线矩阵”摘要（中位数、样本、超额） —— #
     def pack_ou_lines(src: Dict[float, Dict[str, List[float]]]) -> Dict[str, Dict[str, float]]:

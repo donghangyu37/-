@@ -113,9 +113,47 @@ def test_first_half_asian_handicap_filtered(monkeypatch):
 
     result = football_api.odds_by_fixture(1234)
 
-    assert result["_raw_ah_map"] == {
-        -0.5: {
-            "home": [1.83],
-            "away": [2.0],
-        }
+    raw_map = result["_raw_ah_map"]
+    assert -0.5 in raw_map
+    entry = raw_map[-0.5]
+    assert entry["home"] == [1.83]
+    assert entry["away"] == [2.0]
+    labels = entry.get("raw_labels", [])
+    assert all("1st" not in label.lower() for label in labels)
+
+
+def test_asian_handicap_alias_and_value_parsing(monkeypatch):
+    fake_odds = {
+        "response": [
+            {
+                "bookmakers": [
+                    {
+                        "last_update": "2024-09-19T12:00:00+00:00",
+                        "bets": [
+                            {
+                                "name": "HDP",
+                                "values": [
+                                    {"value": "Home -0.25 @1.92", "odd": "1.92"},
+                                    {"value": "Away +0.25 @1.92", "odd": "1.92"},
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        ]
     }
+
+    def _fake_get_cached(endpoint, params, ttl_sec):  # pragma: no cover - exercised in test
+        return fake_odds
+
+    monkeypatch.setattr(football_api, "_get_cached", _fake_get_cached)
+
+    result = football_api.odds_by_fixture(4321)
+
+    assert result["ah_line"] == -0.25
+    assert abs(result["price_ah_home"] - 1.92) < 1e-9
+    assert abs(result["price_ah_away"] - 1.92) < 1e-9
+
+    raw_labels = result.get("ah_raw_labels", {}).get(str(result["ah_line"]), [])
+    assert any(label for label in raw_labels if "hdp" in label.lower())
