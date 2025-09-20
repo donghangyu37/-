@@ -14,6 +14,8 @@ from src.models.poisson_mc import expected_goals_from_strengths, monte_carlo_sim
 from src.markets.asian_handicap import ah_probabilities_from_lams, ah_ev_kelly
 from src.config import HOME_ADV
 from daily_.value_engine import (
+    LEAGUE_TIER_OTHER,
+    LEAGUE_TIER_TOP,
     classify_league_tier,
     evaluate_ev_market,
     value_index as ve_value_index,
@@ -100,6 +102,24 @@ KELLY_FRACTION = 0.25
 STAKE_CAP_PCT = 2.0
 STAKE_MIN_PCT = 0.0
 
+PICKS_GUARD_MIN = 3
+PICKS_BACKOFF_PERCENTILE = 0.7
+PICKS_MARKET_ORDER = ("ou", "1x2", "ah")
+PICKS_TIER_ORDER = (LEAGUE_TIER_TOP, LEAGUE_TIER_OTHER, "unknown")
+PICKS_ALLOWED_BACKOFF_TIERS = {LEAGUE_TIER_TOP, LEAGUE_TIER_OTHER}
+PICKS_STRICT_RULES = {
+    "ou": {"ev": 0.05, "kelly": 0.05, "quality": 0.6, "liquidity": 4.0},
+    "1x2": {"ev": 0.04, "kelly": 0.04, "quality": 0.6, "liquidity": 4.0},
+    "ah": {"ev": 0.04, "kelly": 0.04, "quality": 0.6, "liquidity": 3.0},
+}
+PICKS_BACKOFF1_EV_DELTA = 0.01
+PICKS_BACKOFF1_KELLY = {"ou": 0.03, "1x2": 0.03, "ah": 0.03}
+PICKS_BACKOFF2_KELLY = 0.02
+PICKS_BACKOFF2_EXTRA_EV = 0.02
+PICKS_BACKOFF2_COMPOSITE_MIN = 0.10
+PICKS_BACKOFF2_ODDS_RANGE = (1.6, 2.6)
+PICKS_BACKOFF2_OU_LINE_RANGE = (2.25, 3.0)
+
 # ================== 工具函数 ==================
 def _today_utc_date() -> str:
     return datetime.now(timezone.utc).date().isoformat()
@@ -149,7 +169,7 @@ def apply_ev_filter(
     flag_map: Dict[str, str],
     reason_map: Dict[str, str],
     vi_map: Dict[str, float | None],
-    meta_map: Dict[str, Dict[str, float | str]] | None = None,
+    meta_map: Dict[str, Dict[str, object]] | None = None,
     odds: float | None = None,
     model_prob: float | None = None,
     consensus_prob: float | None = None,
@@ -182,7 +202,8 @@ def apply_ev_filter(
         reason_map[key] = ",".join(str(r) for r in reasons)
     vi_map[key] = res.get("value_index")
     if meta_map is not None:
-        meta_entry: Dict[str, float | str] = {}
+        diagnostics = meta_map.setdefault("diagnostics", {})
+        meta_entry: Dict[str, object] = {}
         quality = res.get("quality")
         if quality is not None:
             try:
@@ -201,8 +222,11 @@ def apply_ev_filter(
                 meta_entry["ev_calibrated"] = round(float(ev_cal), 6)
             except (TypeError, ValueError):
                 pass
+        thresholds = res.get("thresholds")
+        if isinstance(thresholds, dict) and thresholds:
+            meta_entry["thresholds"] = thresholds
         if meta_entry:
-            meta_map[key] = meta_entry
+            diagnostics[key] = meta_entry
     return res.get("ev"), res.get("kelly")
 
 # ===== 四分之一盘精结算（基于 totals 样本）=====
@@ -713,7 +737,7 @@ def _stake_pct_from_kelly(k: Optional[float]) -> float:
     except: return 0.0
 
 def export_picks(rows_all: List[Dict], date_str: str):
-    picks: List[Dict] = []
+    candidates: List[Dict] = []
 
     def _with_quality(payload: Dict, row: Dict, key: str) -> Dict:
         out = dict(payload)
@@ -743,83 +767,391 @@ def export_picks(rows_all: List[Dict], date_str: str):
                 pass
         return out
 
-    for r in rows_all:
-        base = {"date_utc": r.get("date_utc"), "kickoff_utc": r.get("kickoff_utc"),
-                "league": r.get("league"), "home": r.get("home"), "away": r.get("away")}
-        # Goals OU 主盘
-        ev, k = r.get("ev_ou_main_over"), r.get("kelly_ou_main_over")
-        if ev is not None and k is not None and r.get("flag_ev_ou_main_over") == "keep":
-            vi = value_index(ev, k)
-            if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                payload = {**base, "market":"OU-Over", "book":_fmt_ou_book(r.get("ou_main_line"), r.get("odds_ou_main_over"), False),
-                           "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)}
-                picks.append(_with_quality(payload, r, "ev_ou_main_over"))
-        ev, k = r.get("ev_ou_main_under"), r.get("kelly_ou_main_under")
-        if ev is not None and k is not None and r.get("flag_ev_ou_main_under") == "keep":
-            vi = value_index(ev, k)
-            if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                payload = {**base, "market":"OU-Under", "book":_fmt_ou_book(r.get("ou_main_line"), r.get("odds_ou_main_under"), False),
-                           "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)}
-                picks.append(_with_quality(payload, r, "ev_ou_main_under"))
-        # 1X2
-        for mk, evk, kel, odd in [
-            ("1X2-Home", r.get("ev_1x2_home"), r.get("kelly_1x2_home"), r.get("odds_1x2_home")),
-            ("1X2-Draw", r.get("ev_1x2_draw"), r.get("kelly_1x2_draw"), r.get("odds_1x2_draw")),
-            ("1X2-Away", r.get("ev_1x2_away"), r.get("kelly_1x2_away"), r.get("odds_1x2_away")),
-        ]:
-            flag_key = f"flag_{'ev_1x2_home' if mk=='1X2-Home' else 'ev_1x2_draw' if mk=='1X2-Draw' else 'ev_1x2_away'}"
-            if evk is not None and kel is not None and odd is not None and r.get(flag_key) == "keep":
-                vi = value_index(evk, kel)
-                if evk>=PICKS_MIN_EV and kel>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                    payload = {**base, "market":mk, "book":f"{mk}@{float(odd):.2f}",
-                               "ev":float(evk),"kelly":float(kel),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(kel)}
-                    key = "ev_1x2_home" if mk == "1X2-Home" else "ev_1x2_draw" if mk == "1X2-Draw" else "ev_1x2_away"
-                    picks.append(_with_quality(payload, r, key))
-        # AH 主盘
-        ah_line = r.get("ah_line")
+    def _to_float_safe(value) -> float | None:
+        try:
+            if value is None:
+                return None
+            if isinstance(value, (int, float)):
+                return float(value)
+            txt = str(value).strip()
+            if not txt:
+                return None
+            return float(txt)
+        except (TypeError, ValueError):
+            return None
+
+    def _liquidity_for_market(row: Dict, market: str) -> float:
+        if market == "ou":
+            vals = [
+                _to_float_safe(row.get("ou_main_over_cnt")),
+                _to_float_safe(row.get("ou_main_under_cnt")),
+            ]
+        elif market == "1x2":
+            vals = [
+                _to_float_safe(row.get("1x2_home_cnt")),
+                _to_float_safe(row.get("1x2_draw_cnt")),
+                _to_float_safe(row.get("1x2_away_cnt")),
+            ]
+        elif market == "ah":
+            vals = [
+                _to_float_safe(row.get("ah_home_cnt")),
+                _to_float_safe(row.get("ah_away_cnt")),
+            ]
+        else:
+            return 0.0
+        nums = [float(v) for v in vals if v is not None and v > 0]
+        if not nums:
+            return 0.0
+        return float(min(nums))
+
+    def _percentile_threshold(values: List[float], pct: float) -> float | None:
+        arr = [float(v) for v in values if v is not None and math.isfinite(v)]
+        if not arr:
+            return None
+        arr.sort()
+        if len(arr) == 1:
+            return arr[0]
+        pct = max(0.0, min(1.0, pct))
+        pos = pct * (len(arr) - 1)
+        low = int(math.floor(pos))
+        high = int(math.ceil(pos))
+        if low == high:
+            return arr[low]
+        weight = pos - low
+        return arr[low] + (arr[high] - arr[low]) * weight
+
+    def _round_robin_select(pool: List[Dict], limit: int, already: Set[str]) -> List[Dict]:
+        if limit <= 0:
+            return []
+        grouped: Dict[tuple[str, str], List[Dict]] = {}
+        for cand in pool:
+            if cand["id"] in already:
+                continue
+            tier = cand.get("league_tier") or "unknown"
+            key = (cand["market_type"], tier)
+            grouped.setdefault(key, []).append(cand)
+        for group in grouped.values():
+            group.sort(key=lambda c: c["vi"], reverse=True)
+        order = sorted(
+            grouped.keys(),
+            key=lambda item: (
+                PICKS_MARKET_ORDER.index(item[0]) if item[0] in PICKS_MARKET_ORDER else len(PICKS_MARKET_ORDER),
+                PICKS_TIER_ORDER.index(item[1]) if item[1] in PICKS_TIER_ORDER else len(PICKS_TIER_ORDER),
+            ),
+        )
+        selected: List[Dict] = []
+        while len(selected) < limit:
+            progress = False
+            for key in order:
+                group = grouped.get(key)
+                if not group:
+                    continue
+                while group and group[0]["id"] in already:
+                    group.pop(0)
+                if group:
+                    cand = group.pop(0)
+                    already.add(cand["id"])
+                    selected.append(cand)
+                    progress = True
+                    if len(selected) >= limit:
+                        break
+            if not progress:
+                break
+        return selected
+
+    for idx, row in enumerate(rows_all):
+        base = {
+            "date_utc": row.get("date_utc"),
+            "kickoff_utc": row.get("kickoff_utc"),
+            "league": row.get("league"),
+            "home": row.get("home"),
+            "away": row.get("away"),
+        }
+        tier_val = row.get("league_tier")
+        league_tier = str(tier_val) if tier_val not in (None, "") else "unknown"
+
+        liquidity_ou = _liquidity_for_market(row, "ou")
+        ou_line = _to_float_safe(row.get("ou_main_line"))
+        for side, label in (("over", "OU-Over"), ("under", "OU-Under")):
+            key = f"ev_ou_main_{side}"
+            ev_val = _to_float_safe(row.get(key))
+            kelly_val = _to_float_safe(row.get(f"kelly_ou_main_{side}"))
+            if ev_val is None or kelly_val is None:
+                continue
+            flag_val = str(row.get(f"flag_{key}") or "")
+            if flag_val not in ("keep", "review"):
+                continue
+            vi_val = value_index(ev_val, kelly_val)
+            if vi_val is None:
+                continue
+            odds_val = _to_float_safe(row.get(f"odds_ou_main_{side}"))
+            candidates.append(
+                {
+                    "id": f"{idx}:{key}",
+                    "row": row,
+                    "base": base,
+                    "key": key,
+                    "market_type": "ou",
+                    "market_label": label,
+                    "ev": float(ev_val),
+                    "kelly": float(kelly_val),
+                    "vi": float(vi_val),
+                    "flag": flag_val,
+                    "quality": _to_float_safe(row.get(f"quality_{key}")),
+                    "liquidity": liquidity_ou,
+                    "league_tier": league_tier,
+                    "odds": odds_val,
+                    "line": ou_line,
+                    "book": _fmt_ou_book(row.get("ou_main_line"), row.get(f"odds_ou_main_{side}"), False),
+                }
+            )
+
+        liquidity_1x2 = _liquidity_for_market(row, "1x2")
+        for side, label in (("home", "1X2-Home"), ("draw", "1X2-Draw"), ("away", "1X2-Away")):
+            key = f"ev_1x2_{side}"
+            ev_val = _to_float_safe(row.get(key))
+            kelly_val = _to_float_safe(row.get(f"kelly_1x2_{side}"))
+            odds_val = _to_float_safe(row.get(f"odds_1x2_{side}"))
+            if ev_val is None or kelly_val is None:
+                continue
+            flag_val = str(row.get(f"flag_{key}") or "")
+            if flag_val not in ("keep", "review"):
+                continue
+            vi_val = value_index(ev_val, kelly_val)
+            if vi_val is None:
+                continue
+            candidates.append(
+                {
+                    "id": f"{idx}:{key}",
+                    "row": row,
+                    "base": base,
+                    "key": key,
+                    "market_type": "1x2",
+                    "market_label": label,
+                    "ev": float(ev_val),
+                    "kelly": float(kelly_val),
+                    "vi": float(vi_val),
+                    "flag": flag_val,
+                    "quality": _to_float_safe(row.get(f"quality_{key}")),
+                    "liquidity": liquidity_1x2,
+                    "league_tier": league_tier,
+                    "odds": odds_val,
+                    "line": None,
+                    "book": f"{label}@{odds_val:.2f}" if odds_val is not None else label,
+                }
+            )
+
+        liquidity_ah = _liquidity_for_market(row, "ah")
+        ah_line = _to_float_safe(row.get("ah_line"))
         if ah_line is not None:
-            for side, evk, kel, odd in [
-                ("home", r.get("ev_ah_home"), r.get("kelly_ah_home"), r.get("odds_ah_home")),
-                ("away", r.get("ev_ah_away"), r.get("kelly_ah_away"), r.get("odds_ah_away")),
-            ]:
-                flag_key = f"flag_ev_ah_{side}"
-                if evk is not None and kel is not None and odd is not None and r.get(flag_key) == "keep":
-                    vi = value_index(evk, kel)
-                    if evk>=PICKS_MIN_EV and kel>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                        payload = {**base, "market":f"AH-{'Home' if side=='home' else 'Away'}",
-                                   "book":_fmt_ah_book(ah_line, odd, side),
-                                   "ev":float(evk),"kelly":float(kel),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(kel)}
-                        picks.append(_with_quality(payload, r, f"ev_ah_{side}"))
-        # 角球 OU 主盘
-        ev, k = r.get("ev_crn_main_over"), r.get("kelly_crn_main_over")
-        if ev is not None and k is not None and r.get("flag_ev_crn_main_over") == "keep":
-            vi = value_index(ev, k)
-            if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                payload = {**base,"market":"CRN-Over","book":_fmt_ou_book(r.get("crn_main_line"), r.get("odds_crn_main_over"), True),
-                           "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)}
-                picks.append(_with_quality(payload, r, "ev_crn_main_over"))
-        ev, k = r.get("ev_crn_main_under"), r.get("kelly_crn_main_under")
-        if ev is not None and k is not None and r.get("flag_ev_crn_main_under") == "keep":
-            vi = value_index(ev, k)
-            if ev>=PICKS_MIN_EV and k>=PICKS_MIN_KELLY and vi>=PICKS_MIN_VI:
-                payload = {**base,"market":"CRN-Under","book":_fmt_ou_book(r.get("crn_main_line"), r.get("odds_crn_main_under"), True),
-                           "ev":float(ev),"kelly":float(k),"value_index":float(vi),"stake_pct":_stake_pct_from_kelly(k)}
-                picks.append(_with_quality(payload, r, "ev_crn_main_under"))
+            for side, label in (("home", "AH-Home"), ("away", "AH-Away")):
+                key = f"ev_ah_{side}"
+                ev_val = _to_float_safe(row.get(key))
+                kelly_val = _to_float_safe(row.get(f"kelly_ah_{side}"))
+                odds_val = _to_float_safe(row.get(f"odds_ah_{side}"))
+                if ev_val is None or kelly_val is None:
+                    continue
+                flag_val = str(row.get(f"flag_{key}") or "")
+                if flag_val not in ("keep", "review"):
+                    continue
+                vi_val = value_index(ev_val, kelly_val)
+                if vi_val is None:
+                    continue
+                candidates.append(
+                    {
+                        "id": f"{idx}:{key}",
+                        "row": row,
+                        "base": base,
+                        "key": key,
+                        "market_type": "ah",
+                        "market_label": label,
+                        "ev": float(ev_val),
+                        "kelly": float(kelly_val),
+                        "vi": float(vi_val),
+                        "flag": flag_val,
+                        "quality": _to_float_safe(row.get(f"quality_{key}")),
+                        "liquidity": liquidity_ah,
+                        "league_tier": league_tier,
+                        "odds": odds_val,
+                        "line": ah_line,
+                        "book": _fmt_ah_book(row.get("ah_line"), row.get(f"odds_ah_{side}"), side),
+                    }
+                )
 
-    picks.sort(key=lambda x: x.get("value_index", -999), reverse=True)
-    if PICKS_TOP_N is not None:
-        picks = picks[:int(PICKS_TOP_N)]
+    quality_thresholds = {
+        market: _percentile_threshold(
+            [cand.get("quality") for cand in candidates if cand.get("market_type") == market],
+            PICKS_BACKOFF_PERCENTILE,
+        )
+        for market in PICKS_STRICT_RULES
+    }
+    liquidity_thresholds = {
+        market: _percentile_threshold(
+            [cand.get("liquidity") for cand in candidates if cand.get("market_type") == market and cand.get("liquidity")],
+            PICKS_BACKOFF_PERCENTILE,
+        )
+        for market in PICKS_STRICT_RULES
+    }
 
-    out_dir = os.path.join(os.getcwd(), "out"); os.makedirs(out_dir, exist_ok=True)
+    def _assign_gate_level(candidate: Dict) -> str | None:
+        market = candidate.get("market_type")
+        rules = PICKS_STRICT_RULES.get(market)
+        if not rules:
+            return None
+        quality_val = candidate.get("quality")
+        if quality_val is None:
+            quality_val = 0.0
+        liquidity_val = candidate.get("liquidity")
+        if liquidity_val is None:
+            liquidity_val = 0.0
+        flag_val = candidate.get("flag")
+        ev_val = candidate.get("ev")
+        kelly_val = candidate.get("kelly")
+
+        if (
+            flag_val == "keep"
+            and ev_val is not None
+            and kelly_val is not None
+            and ev_val >= rules["ev"]
+            and kelly_val >= rules["kelly"]
+            and quality_val >= rules["quality"]
+            and liquidity_val >= rules["liquidity"]
+        ):
+            return "strict"
+
+        ev_backoff1 = max(0.0, rules["ev"] - PICKS_BACKOFF1_EV_DELTA)
+        kelly_backoff1 = PICKS_BACKOFF1_KELLY.get(market, rules["kelly"])
+        if (
+            flag_val in ("keep", "review")
+            and ev_val is not None
+            and kelly_val is not None
+            and ev_val >= ev_backoff1
+            and kelly_val >= kelly_backoff1
+            and quality_val >= rules["quality"]
+            and liquidity_val >= rules["liquidity"]
+        ):
+            q_thr = quality_thresholds.get(market)
+            l_thr = liquidity_thresholds.get(market)
+            if (q_thr is None or quality_val >= q_thr) and (l_thr is None or liquidity_val >= l_thr):
+                return "backoff1"
+
+        ev_backoff2 = max(0.0, rules["ev"] - PICKS_BACKOFF2_EXTRA_EV)
+        if (
+            flag_val in ("keep", "review")
+            and ev_val is not None
+            and kelly_val is not None
+            and ev_val >= ev_backoff2
+            and kelly_val >= PICKS_BACKOFF2_KELLY
+        ):
+            tier = candidate.get("league_tier") or "unknown"
+            if tier not in PICKS_ALLOWED_BACKOFF_TIERS:
+                return None
+            if market == "ou":
+                line_val = candidate.get("line")
+                if line_val is None:
+                    return None
+                if not (
+                    PICKS_BACKOFF2_OU_LINE_RANGE[0] <= line_val <= PICKS_BACKOFF2_OU_LINE_RANGE[1]
+                ):
+                    return None
+            else:
+                odds_val = candidate.get("odds")
+                if odds_val is None or not (
+                    PICKS_BACKOFF2_ODDS_RANGE[0] <= odds_val <= PICKS_BACKOFF2_ODDS_RANGE[1]
+                ):
+                    return None
+            quality_val = max(0.0, quality_val)
+            liquidity_val = max(0.0, liquidity_val)
+            composite = kelly_val * quality_val * max(liquidity_val, 1.0)
+            candidate["gate_composite"] = composite
+            if composite >= PICKS_BACKOFF2_COMPOSITE_MIN:
+                return "backoff2"
+        return None
+
+    for cand in candidates:
+        cand["gate_level"] = _assign_gate_level(cand)
+
+    eligible = [cand for cand in candidates if cand.get("gate_level")]
+    limit = len(eligible) if PICKS_TOP_N is None else min(int(PICKS_TOP_N), len(eligible))
+    selected: List[Dict] = []
+    already_ids: Set[str] = set()
+
+    level_groups = {
+        level: [cand for cand in eligible if cand.get("gate_level") == level]
+        for level in ("strict", "backoff1", "backoff2")
+    }
+
+    selected.extend(_round_robin_select(level_groups["strict"], limit, already_ids))
+
+    target_min = min(PICKS_GUARD_MIN, limit)
+    if len(selected) < target_min:
+        take = min(limit - len(selected), target_min - len(selected))
+        selected.extend(_round_robin_select(level_groups["backoff1"], take, already_ids))
+    if len(selected) < target_min:
+        take = min(limit - len(selected), target_min - len(selected))
+        selected.extend(_round_robin_select(level_groups["backoff2"], take, already_ids))
+
+    for level in ("strict", "backoff1", "backoff2"):
+        if len(selected) >= limit:
+            break
+        take = limit - len(selected)
+        selected.extend(_round_robin_select(level_groups[level], take, already_ids))
+
+    picks: List[Dict] = []
+    for cand in selected:
+        payload = {
+            **cand["base"],
+            "market": cand["market_label"],
+            "book": cand.get("book"),
+            "ev": float(cand["ev"]),
+            "kelly": float(cand["kelly"]),
+            "value_index": float(cand["vi"]),
+            "stake_pct": _stake_pct_from_kelly(cand["kelly"]),
+        }
+        payload = _with_quality(payload, cand["row"], cand["key"])
+        payload["gate_level"] = cand.get("gate_level")
+        if cand.get("gate_composite") is not None:
+            try:
+                payload["gate_score"] = round(float(cand["gate_composite"]), 6)
+            except (TypeError, ValueError):
+                pass
+        picks.append(payload)
+
+    out_dir = os.path.join(os.getcwd(), "out")
+    os.makedirs(out_dir, exist_ok=True)
     out_file = os.path.join(out_dir, f"picks_{date_str}.csv")
     fieldnames = [
-        "date_utc","kickoff_utc","league","home","away","market","book",
-        "ev","kelly","value_index","stake_pct","quality","ev_input","ev_calibrated","score"
+        "date_utc",
+        "kickoff_utc",
+        "league",
+        "home",
+        "away",
+        "market",
+        "book",
+        "ev",
+        "kelly",
+        "value_index",
+        "stake_pct",
+        "gate_level",
+        "gate_score",
+        "quality",
+        "ev_input",
+        "ev_calibrated",
+        "score",
     ]
     with open(out_file, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        w.writeheader(); [w.writerow(p) for p in picks]
-    print(f"\n已导出下注清单到: {out_file}  （{len(picks)} 条，阈值：EV≥{PICKS_MIN_EV}, Kelly≥{PICKS_MIN_KELLY}, VI≥{PICKS_MIN_VI}）")
+        w.writeheader()
+        for payload in picks[:limit]:
+            w.writerow(payload)
+
+    level_counts = {
+        level: sum(1 for cand in selected if cand.get("gate_level") == level)
+        for level in ("strict", "backoff1", "backoff2")
+    }
+    print(
+        f"\n已导出下注清单到: {out_file}  （{len(picks[:limit])} 条，strict={level_counts['strict']} / backoff1={level_counts['backoff1']} / backoff2={level_counts['backoff2']}）"
+    )
 
 def _median(arr: List[float]) -> Optional[float]:
     arr = [float(x) for x in arr if x];
@@ -1051,7 +1383,7 @@ def main():
         flag_map: Dict[str, str] = {}
         flag_reason_map: Dict[str, str] = {}
         vi_map: Dict[str, float | None] = {}
-        ev_meta_map: Dict[str, Dict[str, float | str]] = {}
+        ev_meta_map: Dict[str, Dict[str, object]] = {}
 
         # ===== 1X2 =====
         o1_h,o1_d,o1_a = odds.get("1x2_home"),odds.get("1x2_draw"),odds.get("1x2_away")
@@ -1635,12 +1967,16 @@ def main():
 
             # 1X2
             "odds_1x2_home": o1_h, "odds_1x2_draw": o1_d, "odds_1x2_away": o1_a,
+            "1x2_home_cnt": cnt_1x2_h, "1x2_draw_cnt": cnt_1x2_d, "1x2_away_cnt": cnt_1x2_a,
+            "1x2_overround": overround_1x2, "1x2_update_age_min": update_age_1x2,
             "ev_1x2_home": ev1_h, "kelly_1x2_home": k1_h,
             "ev_1x2_draw": ev1_d, "kelly_1x2_draw": k1_d,
             "ev_1x2_away": ev1_a, "kelly_1x2_away": k1_a,
 
             # AH（含诊断 + EV）
             "ah_line": ah_line, "odds_ah_home": ah_oh, "odds_ah_away": ah_oa,
+            "ah_home_cnt": odds.get("ah_home_cnt"), "ah_away_cnt": odds.get("ah_away_cnt"),
+            "ah_overround": odds.get("ah_overround"),
             "ev_ah_home": ev_ah_h, "kelly_ah_home": k_ah_h,
             "ev_ah_away": ev_ah_a, "kelly_ah_away": k_ah_a,
 
@@ -1659,7 +1995,15 @@ def main():
             row[f"flag_{key}"] = tag
         for key, reason in flag_reason_map.items():
             row[f"flag_reason_{key}"] = reason
-        for key, meta in ev_meta_map.items():
+        diagnostics_src = ev_meta_map.get("diagnostics")
+        if isinstance(diagnostics_src, dict):
+            diagnostics_items = diagnostics_src.items()
+        else:
+            diagnostics_items = ((k, v) for k, v in ev_meta_map.items() if k != "diagnostics")
+
+        for key, meta in diagnostics_items:
+            if not isinstance(meta, dict):
+                continue
             quality_f: float | None = None
             ev_input_f: float | None = None
             ev_cal_f: float | None = None
@@ -1684,6 +2028,26 @@ def main():
                     row[f"ev_calibrated_{key}"] = round(ev_cal_f, 6)
                 except (TypeError, ValueError):
                     ev_cal_f = None
+            thresholds = meta.get("thresholds")
+            if isinstance(thresholds, dict):
+                keep_min_val = thresholds.get("keep_min")
+                keep_max_val = thresholds.get("keep_max")
+                drop_val = thresholds.get("drop")
+                if keep_min_val is not None:
+                    try:
+                        row[f"threshold_keep_min_{key}"] = round(float(keep_min_val), 4)
+                    except (TypeError, ValueError):
+                        pass
+                if keep_max_val is not None:
+                    try:
+                        row[f"threshold_keep_max_{key}"] = round(float(keep_max_val), 4)
+                    except (TypeError, ValueError):
+                        pass
+                if drop_val is not None:
+                    try:
+                        row[f"threshold_drop_{key}"] = round(float(drop_val), 4)
+                    except (TypeError, ValueError):
+                        pass
             if quality_f is not None and ev_input_f is not None:
                 row[f"score_{key}"] = round(quality_f * ev_input_f, 6)
 
