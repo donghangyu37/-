@@ -1,4 +1,4 @@
-import csv
+
 import importlib.util
 import math
 import os
@@ -85,7 +85,7 @@ if _SPEC is None:  # pragma: no cover - defensive guard
 _daily_brief_module = importlib.util.module_from_spec(_SPEC)
 _LOADER.exec_module(_daily_brief_module)
 apply_ev_filter = getattr(_daily_brief_module, "apply_ev_filter")
-export_picks = getattr(_daily_brief_module, "export_picks")
+
 
 
 def test_apply_ev_filter_populates_diagnostics_meta() -> None:
@@ -132,6 +132,7 @@ def test_apply_ev_filter_populates_diagnostics_meta() -> None:
     assert math.isclose(float(thresholds["keep_min"]), 0.02, rel_tol=1e-9)
     assert math.isclose(float(thresholds["keep_max"]), 0.06, rel_tol=1e-9)
     assert math.isclose(float(thresholds["drop"]), 0.12, rel_tol=1e-9)
+
 
 
 def test_export_picks_applies_gate_levels(tmp_path, monkeypatch) -> None:
@@ -193,3 +194,4 @@ def test_export_picks_applies_gate_levels(tmp_path, monkeypatch) -> None:
     assert markets["OU-Over"]["gate_level"] == "strict"
     assert markets["1X2-Home"]["gate_level"] == "backoff1"
     assert markets["AH-Home"]["gate_level"] == "backoff2"
+main
