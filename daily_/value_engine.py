@@ -438,8 +438,16 @@ def evaluate_ev_market(
     else:
         tag = "review"
 
+    bookmaker_count = _to_float(min_bookmakers)
+    missing_liquidity = False
+    low_liquidity = False
+    if bookmaker_count is None or bookmaker_count <= 0:
+        missing_liquidity = True
+    elif bookmaker_count < float(min_req):
+        low_liquidity = True
+
     reasons = []
-    if min_bookmakers is None or min_bookmakers < min_req:
+    if missing_liquidity:
         reasons.append("bookmakers")
 
     try:
@@ -457,7 +465,7 @@ def evaluate_ev_market(
         reasons.append("stale")
 
     quality, quality_flags = compute_market_quality(
-        min_bookmakers=min_bookmakers,
+        min_bookmakers=bookmaker_count,
         overround=overround_val,
         update_age=upd,
         policy=policy,
@@ -526,13 +534,19 @@ def evaluate_ev_market(
 
     if quality < quality_review_threshold and tag == "keep":
         tag = "review"
+    if low_liquidity and tag == "keep":
+        tag = "review"
 
     vi = value_index(ev_penalized, kelly_val)
     high_ev_cut = policy.get("high_ev_review")
     if high_ev_cut is not None and ev_penalized > float(high_ev_cut):
         guard_reasons = []
-        guard_books = int(policy.get("high_ev_min_bookmakers", min_req))
-        if min_bookmakers is None or min_bookmakers < guard_books:
+        guard_books_val = policy.get("high_ev_min_bookmakers", min_req)
+        try:
+            guard_books = float(guard_books_val)
+        except (TypeError, ValueError):
+            guard_books = float(min_req)
+        if bookmaker_count is None or bookmaker_count < guard_books:
             guard_reasons.append("hi_ev_books")
         guard_max_update = float(policy.get("high_ev_max_update", max_update))
         if upd is None or upd > guard_max_update:

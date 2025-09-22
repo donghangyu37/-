@@ -1,5 +1,6 @@
 
 import importlib.util
+import csv
 import math
 import os
 import sys
@@ -85,6 +86,7 @@ if _SPEC is None:  # pragma: no cover - defensive guard
 _daily_brief_module = importlib.util.module_from_spec(_SPEC)
 _LOADER.exec_module(_daily_brief_module)
 apply_ev_filter = getattr(_daily_brief_module, "apply_ev_filter")
+export_picks = getattr(_daily_brief_module, "export_picks")
 
 
 
@@ -133,6 +135,51 @@ def test_apply_ev_filter_populates_diagnostics_meta() -> None:
     assert math.isclose(float(thresholds["keep_max"]), 0.06, rel_tol=1e-9)
     assert math.isclose(float(thresholds["drop"]), 0.12, rel_tol=1e-9)
 
+
+
+def test_apply_ev_filter_allows_low_liquidity_market() -> None:
+    flag_map: dict[str, str] = {}
+    reason_map: dict[str, str] = {}
+    vi_map: dict[str, float | None] = {}
+    meta_map: dict[str, dict[str, object]] = {}
+
+    ev, kelly = apply_ev_filter(
+        key="ou_low_books",
+        ev=0.08,
+        kelly=0.07,
+        market="ou",
+        tier=LEAGUE_TIER_TOP,
+        min_bookmakers=4,
+        overround=1.08,
+        update_age=4.0,
+        flag_map=flag_map,
+        reason_map=reason_map,
+        vi_map=vi_map,
+        meta_map=meta_map,
+        odds=2.05,
+        model_prob=0.58,
+        consensus_prob=0.54,
+        data_quality=0.9,
+        sample_size=12,
+    )
+
+    assert flag_map.get("ou_low_books") != "reject"
+    assert "ou_low_books" not in reason_map
+    assert ev is not None and ev > 0
+    assert kelly is not None and kelly > 0
+
+    diagnostics = meta_map.get("diagnostics")
+    assert isinstance(diagnostics, dict)
+    entry = diagnostics.get("ou_low_books")
+    assert isinstance(entry, dict)
+    quality = entry.get("quality")
+    ev_calibrated = entry.get("ev_calibrated")
+    assert quality is not None and ev_calibrated is not None
+
+    expected_ev = round(float(ev_calibrated) * float(quality), 6)
+    expected_kelly = round(0.07 * float(quality), 6)
+    assert math.isclose(ev, expected_ev, rel_tol=1e-9, abs_tol=1e-9)
+    assert math.isclose(kelly, expected_kelly, rel_tol=1e-9, abs_tol=1e-9)
 
 
 def test_export_picks_applies_gate_levels(tmp_path, monkeypatch) -> None:
@@ -194,4 +241,3 @@ def test_export_picks_applies_gate_levels(tmp_path, monkeypatch) -> None:
     assert markets["OU-Over"]["gate_level"] == "strict"
     assert markets["1X2-Home"]["gate_level"] == "backoff1"
     assert markets["AH-Home"]["gate_level"] == "backoff2"
-main
