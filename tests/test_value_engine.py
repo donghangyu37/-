@@ -3,7 +3,7 @@ import math
 from daily_.value_engine import LEAGUE_TIER_OTHER, LEAGUE_TIER_TOP, evaluate_ev_market
 
 
-def test_evaluate_rejects_insufficient_bookmakers() -> None:
+def test_evaluate_softens_low_bookmaker_penalty() -> None:
     res = evaluate_ev_market(
         ev=0.05,
         kelly=0.05,
@@ -15,9 +15,12 @@ def test_evaluate_rejects_insufficient_bookmakers() -> None:
         odds=2.0,
         model_probability=0.55,
     )
-    assert res["ev"] is None
-    assert res["tag"] == "reject"
-    assert "bookmakers" in res.get("reasons", ())
+    assert res["ev"] is not None
+    assert res["kelly"] is not None
+    assert res["tag"] == "review"
+    assert "bookmakers" not in res.get("reasons", ())
+    assert math.isclose(res["ev"], 0.037333, rel_tol=1e-9, abs_tol=1e-9)
+    assert math.isclose(res["kelly"], 0.037333, rel_tol=1e-9, abs_tol=1e-9)
     thresholds = res.get("thresholds")
     assert isinstance(thresholds, dict)
     assert math.isclose(float(thresholds["keep_min"]), 0.02, rel_tol=1e-9)
