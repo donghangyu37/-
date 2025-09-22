@@ -1,4 +1,5 @@
 
+import csv
 import importlib.util
 import csv
 import math
@@ -136,7 +137,6 @@ def test_apply_ev_filter_populates_diagnostics_meta() -> None:
     assert math.isclose(float(thresholds["drop"]), 0.12, rel_tol=1e-9)
 
 
-
 def test_apply_ev_filter_allows_low_liquidity_market() -> None:
     flag_map: dict[str, str] = {}
     reason_map: dict[str, str] = {}
@@ -180,6 +180,31 @@ def test_apply_ev_filter_allows_low_liquidity_market() -> None:
     expected_kelly = round(0.07 * float(quality), 6)
     assert math.isclose(ev, expected_ev, rel_tol=1e-9, abs_tol=1e-9)
     assert math.isclose(kelly, expected_kelly, rel_tol=1e-9, abs_tol=1e-9)
+def test_apply_ev_filter_accepts_low_overround_ah() -> None:
+    flag_map: dict[str, str] = {}
+    reason_map: dict[str, str] = {}
+    vi_map: dict[str, float | None] = {}
+
+    ev, kelly = apply_ev_filter(
+        key="ah_home",
+        ev=0.05,
+        kelly=0.05,
+        market="ah",
+        tier=LEAGUE_TIER_TOP,
+        min_bookmakers=10,
+        overround=1.01,
+        update_age=3.0,
+        flag_map=flag_map,
+        reason_map=reason_map,
+        vi_map=vi_map,
+        data_quality=0.9,
+        sample_size=25,
+    )
+
+    assert ev is not None and kelly is not None
+    assert flag_map.get("ah_home") in {"keep", "review"}
+    assert "ah_home" not in reason_map
+    assert vi_map.get("ah_home") is not None
 
 
 def test_export_picks_applies_gate_levels(tmp_path, monkeypatch) -> None:
